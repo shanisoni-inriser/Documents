@@ -1,43 +1,47 @@
-# Victory Platform — SaaS-Grade Microservice Extraction Plan
-## Notification Service + Live Data Service (Zero Functionality Break)
+# Victory Platform — Safe Microservice Migration Plan
+## Splitting the Notification System and the Live Market Data System into separate servers — without breaking anything
 
-**Status:** Authoritative. Supersedes the Gemini-generated `migration_architecture_plan.md`.
 **Date:** 2026-06-12
-**Verification:** Every defect and every coupling claimed in this document was verified by reading the actual source code in `D:\Backend\new_backend\src`. File and line references are given everywhere so you can check them yourself.
+**Promise of this document:** every file path and line number written here was verified by reading the actual source code in `D:\Backend\new_backend\src`. Nothing is assumed. You can open any reference and check it yourself.
 
 ---
 
 ## Table of Contents
 
-1. [TL;DR — the plan in five sentences + the five safety locks](#1-tldr)
-2. [Verdict on the Gemini plan — what it got right, and the 5 places it would have broken production](#2-verdict)
-3. [The corrected system map (what really calls what)](#3-system-map)
-4. [Target architecture](#4-target-architecture)
-5. [The gateway layer (the keystone Gemini was missing)](#5-gateway)
-6. [Notification Service — corrected design](#6-notification-service)
-7. [Live Data Service — corrected design](#7-live-data-service)
-8. [Database, Redis, and "who owns what" rules](#8-data-ownership)
-9. [Authentication](#9-auth)
-10. [The phased migration plan (zero downtime, realistic rollback)](#10-phases)
-11. [Risk register](#11-risks)
-12. [Observability](#12-observability)
-13. [Testing strategy](#13-testing)
-14. [Cutover and rollback runbooks](#14-runbooks)
-15. [Folder structure and deployment](#15-structure)
-16. [Things that will bite you (corrected and extended list)](#16-bites)
+1. [What we are doing, in five sentences](#1-summary)
+2. [The five safety locks — how we make sure nothing breaks](#2-safety)
+3. [The system today — one picture](#3-today)
+4. [Hidden connections in the code — the facts this whole plan is built on](#4-facts)
+5. [The target architecture — where we are going](#5-target)
+6. [The gateway (nginx) — the first and most important piece](#6-gateway)
+7. [Notification Service — full design](#7-notif)
+8. [Live Data Service — full design](#8-livedata)
+9. [Databases, Redis, and the "who owns what" rules](#9-data)
+10. [Authentication](#10-auth)
+11. [The migration, phase by phase](#11-phases)
+12. [Risk register](#12-risks)
+13. [Monitoring and alerts](#13-observability)
+14. [Testing strategy](#14-testing)
+15. [Cutover and rollback runbooks](#15-runbooks)
+16. [Folder structure and deployment](#16-structure)
+17. [Things that will bite you — the checklist of classic mistakes](#17-bites)
+18. [Final implementation order — one page](#18-order)
 
 ---
 
-<a name="1-tldr"></a>
-## 1. TL;DR — the plan in five sentences
+<a name="1-summary"></a>
+## 1. What we are doing, in five sentences
 
-1. **First put a reverse proxy (nginx) in front of everything** so all clients — the admin panel *and the mobile app* — keep talking to one address forever; after that, moving a route to a new service is a one-line config change, and rolling back is flipping that line back.
-2. **Extract the Notification Service first** (lower risk), but — unlike the Gemini plan — the monolith keeps a thin, drop-in `NotificationClient` because **three business flows inside the monolith fire notifications in-process** (trade auto-exit, trade expiry cron, plan-sync pushes) and would silently die otherwise.
-3. **Extract the Live Data Service second**, moving the *entire* tick path **including `realtimeAggregator` with a WRITE database pool** (the Gemini plan made it read-only, which would have silently stopped all candle/chart data), and making the live-data service the *single owner* of the Angel One login while the monolith becomes a token *reader*.
-4. **Never run two copies of the broker connections at the same time** (the Gemini "dual-run" plan would make the two processes invalidate each other's Angel One session); instead, cut over during a market-closed window, when there are zero live ticks and therefore zero user impact.
-5. **Never delete monolith code on cutover day** — keep the old path dormant behind a flag for a 2–4 week bake period, then delete.
+1. **First we put a "traffic director" (nginx) in front of everything**, so that the website and the mobile app keep talking to one single address forever. After that, moving any feature to a new server is a one-line config change — and undoing it is flipping that line back.
+2. **We extract the Notification Service first** (it is the lower-risk one). The monolith keeps a small, drop-in "NotificationClient" file, because three business flows inside the monolith fire notifications directly from code (trade auto-exit, trade expiry, plan changes) — and they must keep working exactly as today.
+3. **We extract the Live Data Service second**, moving the *entire* tick pipeline — including the candle-writing part (`realtimeAggregator`), which needs **write** access to the database. Skipping that one file would silently kill all chart data.
+4. **We never run two copies of the broker connections at the same time.** Instead, we switch over during a weekend evening when the market is closed — zero live ticks means zero chance of missing anything.
+5. **We never delete old code on switch-over day.** The old path stays sleeping behind a switch for 2–4 weeks. Only after the new services have survived real production weeks do we delete anything.
 
-### 1.1 The five safety locks — how we make sure nothing breaks
+---
+
+<a name="2-safety"></a>
+## 2. The five safety locks — how we make sure nothing breaks
 
 First, an honest sentence: no engineer on earth can promise a literal "100%" — anyone who does is selling something. What we **can** do — and what this plan does — is design the migration so that:
 
@@ -45,197 +49,64 @@ First, an honest sentence: no engineer on earth can promise a literal "100%" —
 - every step can be **undone in seconds to minutes**, **and**
 - any problem that somehow slips through is **caught by an alarm, not by a customer**.
 
-When all three are true at every step, the practical risk of losing functionality is as close to zero as production engineering allows. This plan achieves it with **five independent locks** — even if one lock somehow fails, the other four still protect you. This is the same pattern (proxy → flags → canary → golden tests → bake period) that large SaaS companies use for exactly this kind of extraction.
+When all three are true at every step, the practical risk of losing functionality is as close to zero as production engineering allows. This plan achieves it with **five independent locks** — even if one lock somehow fails, the other four still protect you. This is the same pattern that large SaaS companies use for exactly this kind of work.
 
 **🔒 Lock 1 — Clients never change, ever.**
-The web admin panel and the mobile app keep talking to one single address forever. All the "moving" happens behind the nginx curtain. A client that doesn't change cannot break.
+The web admin panel and the mobile app keep talking to one single address forever. All the "moving" happens behind the curtain (see §6). A client that doesn't change cannot break.
 
 **🔒 Lock 2 — Every step has a seconds-level undo.**
 
 ```
   THE ROLLBACK LADDER — how fast can we undo, at any moment?
 
-  Phase 0   nginx pass-through installed   →  point DNS back............(minutes)
-  Phase 1   message pipe inside monolith   →  flip 1 flag...............(seconds)
-  Phase 2   notif routes moved to :3005    →  flip 1 nginx line.........(seconds)
-  Phase 2   consumer + cron flipped        →  flip 2 flags..............(< 1 min)
-  Phase 3   live-data cutover              →  4 steps in reverse........(< 5 min)
-  Bake      is old code deleted? NO        →  old path redeployable.....(minutes)
+  Phase 0   nginx installed (pass-through)  →  point DNS back............(minutes)
+  Phase 1   message pipe inside monolith    →  flip 1 switch.............(seconds)
+  Phase 2   notif routes moved to :3005     →  flip 1 nginx line.........(seconds)
+  Phase 2   consumer + cron flipped         →  flip 2 switches...........(< 1 min)
+  Phase 3   live-data switch-over           →  4 steps in reverse........(< 5 min)
+  Bake      is old code deleted? NO         →  old path redeployable.....(minutes)
 ```
 
 There is **no point in this entire migration** where going back takes longer than a coffee break.
 
 **🔒 Lock 3 — We compare against recorded reality, not against hope.**
 
+> **📘 New concept — "golden files":** before changing anything, we record exactly what the system sends today — the WebSocket messages, the API responses, the Redis values, the database rows. These recordings are called *golden files*. Later, the new service must produce **byte-for-byte the same output** from the same input. "Nothing changed" stops being an opinion and becomes a measured fact.
+
 ```
   Phase 0: RECORD what the system               Later: COMPARE the new service
-  does today (the "golden files")               against those recordings
+  does today (the golden files)                 against those recordings
 
   ┌──────────────────────┐                      ┌────────────────────────────┐
-  │  live system today   │                      │  new service (in staging)  │
+  │  live system today   │                      │  new service (in testing)  │
   │   WS messages ───────┼──► saved files  ───► │   same inputs replayed     │
-  │   REST responses ────┼──► saved files       │   outputs diffed vs files  │
+  │   REST responses ────┼──► saved files       │   outputs compared to files│
   │   Redis values ──────┼──► saved files       │                            │
   │   candle DB rows ────┼──► saved files       │   ANY difference =         │
   └──────────────────────┘                      │   STOP → fix → re-test     │
                                                 └────────────────────────────┘
 ```
 
-"Nothing changed" stops being an opinion and becomes a **byte-for-byte verified fact**.
-
 **🔒 Lock 4 — Only one thing changes at a time.**
 Every phase moves exactly one part while everything else stays frozen. If anything misbehaves, there is exactly **one suspect** — no guessing, no debugging two changes at once at 9:15 AM.
 
 **🔒 Lock 5 — Old code is never deleted until the new path has survived weeks of real production.**
-During the bake period the monolith can take back any job within minutes. Deletion happens only after the new service has handled real market days and real notification traffic without incident.
+During the bake period (see box below) the monolith can take back any job within minutes.
 
-### 1.2 What this plan will NEVER do (hard rules)
+> **📘 New concept — "bake period":** after a switch-over, we keep the old code in place (turned off, but ready) for 2–4 weeks while the new service handles real traffic. Like letting a cake bake fully before you take it out — we don't declare success on day one.
 
-1. **No AI tool runs any database query — ever.** Nothing in this migration has been executed against your database, and nothing will be. The only SQL in this entire plan is **three additive statements** (§8.5) that **your team runs by hand**, after taking a backup.
+### 2.1 What this plan will NEVER do (hard rules)
+
+1. **No AI tool runs any database query — ever.** Nothing in this migration was executed against your database, and nothing will be. The only SQL in this entire plan is **three additive statements** (§9.5) that **your team runs by hand**, after taking a backup.
 2. **No existing data is modified or deleted by the migration.** No `DROP`, no `DELETE`, no `UPDATE` of user data — the three statements only *add* (two columns, one constraint, one read-only login).
-3. **No URL, payload shape, event name, or WebSocket message ever changes.** The contracts in §7.2 are frozen and verified by golden tests.
-4. **No two broker connections at the same time** — that is the thing that would corrupt Angel One sessions (§2.3 Error B).
-5. **No business-logic refactoring during the move.** Code moves as-is. Only the explicitly listed import swaps (§6.2) and two small adapters (§7.4, §7.5) change — and each is named, file by file, line by line.
+3. **No URL, payload shape, event name, or WebSocket message ever changes.** The contracts in §8.2 are frozen and verified by golden files.
+4. **No two broker connections at the same time** — running the same broker login from two processes makes them log each other out (§8.4).
+5. **No business-logic refactoring during the move.** Code moves as-is. Only the explicitly listed import swaps (§7.2) and two small adapters (§8.5, §8.6) change — each named, file by file, line by line.
 
 ---
 
-<a name="2-verdict"></a>
-## 2. Verdict on the Gemini plan
-
-### 2.1 What it got right (keep these decisions)
-
-The plan is not garbage — its file inventory is largely accurate, and several of its judgment calls are correct. We keep them:
-
-| Decision | Verdict |
-|---|---|
-| Do **not** extract the Signal WebSocket from the Strategy Engine (:3003) | ✅ Correct. It's ~170 lines of same-process unicast. Extracting it adds latency and race conditions for zero benefit. |
-| Use **Redis Streams** (not Pub/Sub, not RabbitMQ/Kafka) for notification dispatch | ✅ Correct choice. Durable, replayable, no new infrastructure. |
-| Keep a **shared database** for now; don't split schemas | ✅ Correct. Splitting DBs during extraction multiplies risk. |
-| Don't touch the data pipeline / `ohlc:candle_close` flow | ✅ Correct. Already decoupled via Redis. |
-| Extract notifications **before** live data | ✅ Correct ordering. |
-| Move code **as-is**, don't refactor business logic during the move | ✅ Correct principle (the plan then violates it by missing required changes — see below). |
-
-### 2.2 The five verified defects that would have broken production
-
-Each defect below follows the same pattern: **what the plan says → what the code actually does → what breaks**. Every claim has a file:line reference you can open.
-
----
-
-#### Defect 1 — "Move all notification code out, then delete it from the monolith" silently kills trade auto-exit notifications
-
-**The plan says** (its §4.3, §10 Phase 2.2/2.11): move `notificationBroadcast.service.js` and friends entirely to the new service, then remove notification code from the monolith.
-
-**The code actually does:** the monolith's own business logic calls the notification service *as an in-process function*, from places the plan never lists:
-
-- `src/controllers/tradeRecommendations.controller.js:6-7` imports `broadcastNotificationByQuery` directly.
-- It calls it at lines **939, 956, 973, 989** inside `sendAutoExitNotifications()` — this is what notifies users when a trade recommendation hits **target, stop-loss, or expiry**.
-- That function is invoked from at least four call sites (lines **1218, 1397, 1451, 1502**), including the expiry path.
-- `src/services/tradeExpireCron.js:2` requires `autoCloseExpiredTrades` from that same controller — so the **cron that stays in the monolith** drives notifications through the **code that was just deleted**.
-
-**What breaks:** after Phase 2.11, every auto-exit / stop-loss / target-hit / expiry push notification stops. And here is the nasty part — every one of these calls is wrapped in `try/catch` with only a `console.error` (e.g. line 1224: *"Failed to send auto-close notification"*). The app does not crash. Nothing alerts. **Notifications just silently stop arriving**, and you find out from angry users.
-
----
-
-#### Defect 2 — `planSync.service.js` is a second, completely unlisted Firebase consumer in the monolith
-
-**The plan says:** the only Firebase consumers are the notification services and controllers it lists. Remove the Firebase service-account JSON from the monolith after extraction (its §14.4 point 3).
-
-**The code actually does:**
-
-- `src/services/planSync.service.js:2` — `const admin = require("../config/firebase")` — it talks to Firebase **directly**, sending *silent data-only pushes* (line 40-48) that tell the mobile app a user's plan changed.
-- It is called from billing flows that stay in the monolith: `src/controllers/plansNew.controller.js:74` and `src/controllers/proPlanTransactions.controller.js:90` and `:155`.
-
-**What breaks:** the moment Firebase credentials leave the monolith, **plan purchases and plan changes stop syncing to users' phones**. Again wrapped in `catch → console.error` (lines 65, 113) — a silent failure in the *billing* path, the worst possible place.
-
----
-
-#### Defect 3 — "Live data service gets a read-only DB pool (max 3)" silently stops all candle/chart data
-
-**The plan says** (its §8.1, §10 Phase 3.3): the live-data service accesses `victory_market_db` **read-only**, pool max 3, only for `InternalTokenList` and `control_tradingdays`.
-
-**The code actually does:**
-
-- `src/services/marketData/realtimeAggregator.service.js` is required by the Angel One tick path itself — `angelWebSocket.service.js:6` and `angelWebSocket.service.v2.js:7`.
-- The aggregator **builds 1-minute OHLC candles from live ticks and WRITES them to TimescaleDB**: it imports the Timescale client (line 2), runs **"🔥 Parallel DB inserts"** (line 54), calls `newOhlcQueries.insert1MinCandle(data)` (line 218) and `timescaleClient.query(...)` (lines 222-227) on a flush timer (line 25).
-- The aggregator does not even appear in the plan's move list or folder structure.
-
-**What breaks:** move the brokers out with a read-only pool and **every candle insert fails**. Charts, history, intervals, movers, sparklines — everything that reads `OHLC_*` tables — slowly goes stale during market hours. Live tick prices would still flash on screen (making it *look* fine in a quick test), while the underlying historical data quietly stops being written. This is precisely the kind of "features which are working right now smoothly will not work smoothly" failure your senior reviewers warned about.
-
-**Correction:** `realtimeAggregator.service.js` (and its write path) moves **with** the tick path, and the live-data service gets a **read/write** pool sized for parallel inserts (start at 10, tune from pool metrics).
-
----
-
-#### Defect 4 — Moving `marketData/angelAuth.service.js` crashes the monolith on boot
-
-**The plan says** (its §12.1): all of `services/marketData/angel*` move to the live-data service.
-
-**The code actually does:**
-
-- `src/services/angel.service.js:2` — a service that **stays in the monolith** (it serves historical-candle REST data; see the SmartAPI Historical docs comment at line 19) — does `require('./marketData/angelAuth.service.js')`.
-
-**What breaks:** after the file move, the monolith's `require()` resolves to a missing file and the **whole monolith fails to start**. This one at least fails loudly — but it would have failed *on cutover day*, in production, at the worst time.
-
-**Correction:** the monolith keeps a small *token-reader* module (see §7.4), and `angel.service.js` switches one import. The Angel One *login/refresh* moves to the live-data service as the single owner.
-
----
-
-#### Defect 5 — `broker.controller.js` reads the in-process BrokerManager singleton and would silently lie after extraction
-
-**The plan says:** nothing. This file is never mentioned.
-
-**The code actually does:** `src/controllers/broker.controller.js:1,5` calls `getBrokerManager()` — the in-process singleton. This serves the admin panel's broker status endpoint.
-
-**What breaks:** after extraction, `getBrokerManager()` in the monolith returns a **fresh, empty singleton** (no registered brokers). The endpoint doesn't error — it reports "no brokers", which is worse than an error because it looks like a real outage.
-
-**Correction:** `broker.controller.js` becomes a thin HTTP proxy to the live-data service's `/health` (see §7.5).
-
----
-
-### 2.3 Four serious design errors (beyond outright breakage)
-
-#### Error A — "Just change the frontend URL to :3004/:3005" ignores the mobile app, and the anti-gateway argument is wrong
-
-The plan's only client-side change is editing URLs in the React admin panel. But this platform has a **mobile app** (the entire FCM/`push_devices` pipeline exists to push to phones; endpoints like `getNotificationUserWise`, `mark-delivered`, `mark-opened` are user-feed endpoints called by the app, not the admin panel). **You cannot hot-edit a URL inside apps already installed on users' phones.** Any plan that moves public endpoints to new ports breaks shipped clients or forces a coordinated app release + forced upgrade.
-
-The plan explicitly rejects a gateway for WebSockets, claiming "API gateways add latency to every tick (microseconds matter for market data)". This is not a real concern: an nginx proxy hop inside the same machine/VPC adds **well under a millisecond**, while the tick already travels tens of milliseconds over the public internet to the browser. nginx proxies WebSockets natively and handles millions of concurrent connections in production at companies far larger than this one.
-
-**Correction:** a reverse proxy is the *first* thing we deploy (§5). After that, no client — web or mobile — ever changes a URL, and every cutover/rollback becomes a one-line routing change.
-
-#### Error B — "Dual-run" of broker connections (its Phase 3.6–3.8) is built on sand
-
-The plan's centerpiece for live-data cutover is running broker connections in the monolith **and** the new service simultaneously, then comparing output. Three reasons this fails:
-
-1. **Session invalidation.** Both processes would run `AngelAuthService.login()` / the token scheduler / the 8:45 AM cron with the *same system credentials*. Broker session APIs commonly invalidate the previous session on a new login — the two processes would knock each other offline in a loop. The plan even admits "some brokers may reject the second connection" (its §14.4) and proceeds anyway.
-2. **The dedup claim is false.** The plan says TickGate's 50ms duplicate suppression "prevents broadcast duplicates" during dual-run. TickGate state is **per-process memory** — two processes each have their own TickGate and suppress nothing across each other.
-3. **The comparison is meaningless.** Two independent WS connections receive ticks at slightly different times; `PRICE:LATEST` last-writer-wins flapping between two writers makes "100% parity" unmeasurable.
-
-**Correction:** no dual-run, ever. Cut over in a **market-closed window** (evening/weekend) when there are zero live ticks, validate the new service's pipeline against **recorded golden traffic** beforehand, and war-room the next market open (§10 Phase 3, §14).
-
-#### Error C — Idempotency by feature flag is not idempotency
-
-"Only ONE cron runs, controlled by feature flag" is a *hope*, not a guarantee. Deploy overlaps, crash-restarts, or a mistyped flag means two crons. And even today, the code marks a notification `SENT` *after* pushing — a crash between push and mark means a duplicate blast on restart.
-
-**Correction:** make duplicates *impossible at the database level*, not the process level — an atomic claim (`UPDATE … WHERE status='PENDING' RETURNING`) before sending, and a unique constraint on `push_notifications(notification_id, user_id)`. Then a double cron is harmless by construction (§6.4).
-
-#### Error D — It plans to migrate dead code through the riskiest phase
-
-`src/services/smartapiStream.js` (the order-depth feed) is **not required by any file in `src/`** — the only references are comments in `Migration/028_fix_on_conflict_constraints.sql`. It is never started from `index.js`. The plan treats it as a live component, moves it, and budgets risk for it. Meanwhile `indexCalculation.service.js` reads `Order_Depth:*` Redis keys that this dormant file was supposed to write — **verify whether the depth feature works at all today** before spending any migration effort on it (§10 Phase 0.5).
-
-### 2.4 Smaller gaps (fixed in this plan)
-
-- **No horizontal-scaling path for the WS service** — ingest (broker connections) and fan-out (client WebSockets) stay fused in one process with in-memory callbacks, so you can never run two instances. We add an internal Redis pub/sub seam now, cheaply (§7.3).
-- **No backpressure handling** — broadcasting with `ws.send()` to a slow client grows `bufferedAmount` unbounded (memory blowup). One guard line fixes it (§7.6).
-- **Security regressions waved through** — `notification_query` executes **arbitrary SQL stored in a database table** using a full-privilege pool. Extraction is exactly the moment to run those queries under a read-only role with a statement timeout (§8.4). Also: hardcoded `JWT_SECRET`, hardcoded session secret, `cors({origin:true, credentials:true})`.
-- **Deleting monolith code immediately after cutover** — we keep dormant flagged paths through a bake period instead (§10).
-- **No end-to-end tick-lag metric, no Stream backlog alerting, no DLQ** (§12).
-- **An accidental benefit never mentioned:** today, `process.on("uncaughtException", … process.exit(1))` in `index.js:464` means **any crash in any of ~150 admin routes kills the live market feed for every connected user**. Extraction fixes this blast-radius problem — it's one of the strongest arguments *for* this migration and belongs in the business case.
-
----
-
-<a name="3-system-map"></a>
-## 3. The corrected system map
-
-### 3.0 The system today, in one picture
+<a name="3-today"></a>
+## 3. The system today — one picture
 
 ```
 THE SYSTEM TODAY — everything inside the big box is ONE process on :3002
@@ -261,70 +132,115 @@ THE SYSTEM TODAY — everything inside the big box is ONE process on :3002
    users, notifications…           PRICE:LATEST:*    (TimescaleDB candles)
 
   ⚠ Important fact: today, a crash ANYWHERE in those ~140 routes kills the
-    live market feed for every user, because index.js does process.exit(1)
-    on any uncaught exception. Separating the services FIXES this —
-    it is one of the strongest reasons to do this migration at all.
+    live market feed for every user, because index.js (line 464) does
+    process.exit(1) on any uncaught exception. Separating the services
+    FIXES this — it is one of the strongest reasons to do this migration.
 ```
 
-### 3.1 The five notification trigger paths (the plan knew about two)
+> **📘 New concept — FCM (Firebase Cloud Messaging):** Google's free service for sending push notifications to phones. Your backend gives Firebase a message + a device token, and Firebase delivers it to the user's phone. Each user's phone registers a *token* (stored in your `push_devices` table).
+
+> **📘 New concept — tick:** one live price update from the stock broker — "RELIANCE is now ₹2,850.50". During market hours, thousands of ticks per minute flow through the system.
+
+### 3.1 The FIVE places that fire notifications (knowing all five is critical)
 
 ```
-PATH 1  Admin "Send Now"        → POST /api/notification/send → broadcastNotificationByQuery → FCM
-PATH 2  Scheduled                → autoNotificationCron (every minute) → sendScheduledNotification → FCM
-PATH 3  Trade auto-exit          → tradeRecommendations.controller (target/SL hit during LTP update,
-        (MISSED BY GEMINI)         lines 1218/1397/1451) → broadcastNotificationByQuery → FCM
-PATH 4  Trade expiry             → tradeExpireCron → autoCloseExpiredTrades →
-        (MISSED BY GEMINI)         sendAutoExitNotifications (line 1502) → broadcastNotificationByQuery → FCM
-PATH 5  Plan change (billing)    → plansNew.controller:74 / proPlanTransactions.controller:90,155
-        (MISSED BY GEMINI)         → planSync.service → firebase-admin directly (silent data push)
+PATH 1  Admin clicks "Send Now"  → POST /api/notification/send → broadcast service → FCM
+PATH 2  Scheduled notification    → every-minute cron checks date+time → send → FCM
+PATH 3  Trade hits target/SL      → tradeRecommendations.controller (lines 1218/1397/1451)
+                                    → broadcast service → FCM
+PATH 4  Trade expires             → tradeExpireCron → autoCloseExpiredTrades
+                                    → broadcast service (line 1502) → FCM
+PATH 5  User's plan changes       → plansNew.controller:74 / proPlanTransactions:90,155
+                                    → planSync.service → Firebase directly (silent push)
 ```
 
-Paths 3, 4, 5 originate inside monolith business logic. They are **why the monolith must keep a notification client** after extraction (§6.2).
+Paths 1 and 2 are the "obvious" ones. **Paths 3, 4 and 5 start inside the monolith's own business logic** — they are the reason the monolith must keep a small notification client after the split (§7.2). Forget any one of them, and that flow silently stops sending pushes.
 
-### 3.2 The corrected live-data flow (with the part Gemini missed in bold)
+### 3.2 The live data flow today (with the part people usually miss, in bold)
 
 ```
 BROKER (Angel One / Dhan)
-   ↓ ws connection
-Broker adapter (BaseBrokerWS subclass / angelWebSocket.service.v2)
-   ↓ normalized tick
-   ├─→ BrokerManager._onTick → TickGate (8 rules) → Redis SET PRICE:LATEST:{symbol} (60s TTL)
-   │                                              → InternalMarketWS.pushPrice → /ws/market clients
-   ├─→ broadcastPrice → ALL /ws/prices clients (admin panel marketWs.js)
-   └─→ **realtimeAggregator: builds 1-min OHLC candles in memory,
-        flush timer → PARALLEL WRITES to TimescaleDB (victory_market_db)**   ← must move, needs WRITE pool
+   ↓ WebSocket connection
+Broker adapter (parses the raw feed into a clean tick)
+   ↓
+   ├─→ TickGate (8 sanity checks) → Redis SET PRICE:LATEST:{symbol} (60s expiry)
+   │                              → push to /ws/market subscribers
+   ├─→ broadcast to ALL /ws/prices clients (what the admin panel uses)
+   └─→ **realtimeAggregator: collects ticks into 1-minute candles
+        and WRITES them into TimescaleDB on a flush timer**   ← this is what
+                                                                 charts/history
+                                                                 are built from
 ```
 
-### 3.3 Monolith components that *stay* but depend on live-data outputs
+> **📘 New concept — candle (OHLC):** charts don't store every tick. They store, per minute: the Open, High, Low and Close price (plus volume) — one "candle" per minute. The `realtimeAggregator` is the worker that builds these candles from live ticks and saves them to the database.
 
-| Monolith component | Depends on | After extraction | Action needed |
-|---|---|---|---|
-| `controllers/price.controller.js` → `price.service.js` | Redis `PRICE:LATEST:*` | ✅ Keeps working (shared Redis, same keys) | None — document the contract |
-| `controllers/indices.controller.js` → `indexCalculation.service.js` | Redis `PRICE:LATEST:*` / `Order_Depth:*` | ✅ Works *if* those keys are written | Verify depth keys are written at all (Defect/Error D) |
-| `controllers/intervals.controller.js`, `history.controller.js`, `movers.controller.js` (+ their services) | `OHLC_*` candles in TimescaleDB | ✅ Works **only because** the aggregator moves with a WRITE pool | Defect 3 fix |
-| `services/angel.service.js` (historical candles) | Angel session token via `angelAuth.service` | ❌ Crashes on boot (missing require) | Token-reader refactor (§7.4) |
-| `controllers/broker.controller.js` | In-process `getBrokerManager()` | ❌ Reports "no brokers" (silent lie) | Proxy to live-data `/health` (§7.5) |
-| `tradeRecommendations.controller.js`, `planSync.service.js`, `tradeExpireCron.js` | In-process notification functions | ❌ Silent notification loss | `NotificationClient` (§6.2) |
+### 3.3 The clients — and which ones we can never break
 
-### 3.4 Clients (the contract owners)
-
-| Client | Uses | Can we redeploy it instantly? |
+| Client | Uses | Can we update it instantly? |
 |---|---|---|
-| Admin panel (React, `D:\Admin-panel`) | REST `/api/*` on :3002, WS `/ws/prices`, Strategy Engine :3003 | Yes (web) |
-| **Mobile app (VictoryApp)** | FCM pushes, user-feed endpoints (`getNotificationUserWise`, `mark-delivered`, `mark-opened`, `save-token`…), likely market WS | **No — installed on user phones** |
-| Strategy Engine (:3003) | Redis `ohlc:candle_close` (from data pipeline), shared JWT secret | Yes, but no changes needed |
+| Admin panel (React web app) | REST `/api/*`, WebSocket `/ws/prices` | Yes — it's a website |
+| **Mobile app (on user phones)** | FCM pushes, user-feed endpoints (`getNotificationUserWise`, `mark-delivered`, `mark-opened`, `save-token`…) | **NO — it is installed on phones. Its URLs are frozen.** |
+| Strategy Engine (:3003) | Redis events, shared JWT secret | Yes, but it needs zero changes |
 
-The mobile app is the reason the gateway (§5) is non-negotiable: its URLs are frozen.
+The mobile app is the single most important constraint in this whole plan: **we can never move a URL it uses.** That is why the gateway (§6) comes first.
 
 ---
 
-<a name="4-target-architecture"></a>
-## 4. Target architecture
+<a name="4-facts"></a>
+## 4. Hidden connections in the code — the facts this whole plan is built on
+
+A migration breaks things when it misses a hidden connection. Below are the six hidden connections found by reading the actual source code. Each one shapes a specific part of this plan. **If you remember nothing else from this document, remember these six.**
+
+### Fact 1 — Trade notifications are fired from inside the trade controller
+
+`src/controllers/tradeRecommendations.controller.js` lines 6–7 import the broadcast service directly, and call it at lines **939, 956, 973, 989** (inside `sendAutoExitNotifications()`) — this is what notifies users when a trade hits **target, stop-loss, or expiry**. It is triggered from four places (lines 1218, 1397, 1451, 1502), including the expiry cron.
+
+**Danger:** these calls are wrapped in `try/catch` that only does `console.error`. If notification code is simply moved out of the monolith, these pushes don't crash — **they silently stop arriving**, and you find out from angry users.
+**Plan response:** the `NotificationClient` (§7.2).
+
+### Fact 2 — Plan-change pushes use Firebase directly, from billing code
+
+`src/services/planSync.service.js` line 2 imports Firebase directly and sends silent pushes that tell the mobile app a user's plan changed. It is called from `plansNew.controller.js:74` and `proPlanTransactions.controller.js:90, 155` — billing flows that stay in the monolith.
+
+**Danger:** remove Firebase credentials from the monolith and **plan purchases stop syncing to phones** — silently (errors only go to `console.error` at lines 65, 113).
+**Plan response:** same `NotificationClient` (§7.2), one more import swap.
+
+### Fact 3 — The tick pipeline WRITES to the database (it is not read-only)
+
+`src/services/marketData/realtimeAggregator.service.js` is imported by the Angel One tick path itself (`angelWebSocket.service.js:6`, `angelWebSocket.service.v2.js:7`). It builds 1-minute candles and **writes them to TimescaleDB**: parallel inserts (line 54), `insert1MinCandle` (line 218), on a flush timer (line 25).
+
+**Danger:** if the live data system is extracted with a "read-only" database connection — which sounds safe but is wrong — every candle insert fails, and charts/history/movers **slowly go stale during market hours** while live prices still flash on screen (so a quick test looks fine).
+**Plan response:** the aggregator moves *with* the tick path, with a **read/write** pool (§8.1).
+
+### Fact 4 — A monolith file imports from the folder being moved out
+
+`src/services/angel.service.js` line 2 — a file that **stays** in the monolith (it serves historical candle data) — does `require('./marketData/angelAuth.service.js')`, a file that **moves** to the live data service.
+
+**Danger:** after the move, the monolith's `require()` points at a missing file and **the whole monolith refuses to start**.
+**Plan response:** a small "token reader" adapter in the monolith (§8.5), shipped *before* switch-over day.
+
+### Fact 5 — The broker status endpoint reads in-process memory
+
+`src/controllers/broker.controller.js` lines 1, 5 call `getBrokerManager()` — a singleton that lives in the same process as the brokers. After the split, this returns a fresh **empty** manager.
+
+**Danger:** the admin panel's broker status page would confidently report "no brokers" — not an error, a **lie**.
+**Plan response:** that controller becomes a tiny proxy to the live data service's `/health` (§8.6).
+
+### Fact 6 — The order-depth feed appears to be dead code
+
+`src/services/smartapiStream.js` (the order-depth feed) is **imported by no file in `src/`** — the only mentions are comments inside `Migration/028_fix_on_conflict_constraints.sql`. It is never started from `index.js`. Meanwhile `indexCalculation.service.js` reads `Order_Depth:*` Redis keys that this file was supposed to write.
+
+**Plan response:** Phase 0 settles whether order-depth works at all today, *before* anyone spends migration effort on it — and before anyone blames the migration for a feature that was already dead (§11, Phase 0.5).
+
+---
+
+<a name="5-target"></a>
+## 5. The target architecture — where we are going
 
 ```
                         ┌──────────────────────────────────────────────┐
-   Admin Panel (web)    │              NGINX (one public origin)        │   Mobile App
-   ─────────────────────►  path-based routing:                          ◄──────────────
+   Admin Panel (web)    │           NGINX  (one public address)         │   Mobile App
+   ─────────────────────►  routes by URL path:                          ◄──────────────
                         │   /ws/prices, /ws/market      → live-data :3004
                         │   /api/notification*           → notif-svc :3005
                         │   /api/notifications*          → notif-svc :3005
@@ -335,49 +251,66 @@ The mobile app is the reason the gateway (§5) is non-negotiable: its URLs are f
                  ┌──────────────▼───┐  ┌───────▼────────┐  ┌──▼──────────────────┐
                  │ MONOLITH :3002   │  │ NOTIF SVC :3005│  │ LIVE-DATA SVC :3004 │
                  │ auth, users,     │  │ all notif      │  │ brokers, TickGate,  │
-                 │ billing, ~140    │  │ routes + crons │  │ BrokerManager,      │
-                 │ admin routes,    │  │ FCM (firebase) │  │ MarketScheduler,    │
-                 │ GraphQL, trade   │  │ stream consumer│  │ wsHub + both WS     │
-                 │ recs, content    │  │ + DLQ          │  │ endpoints,          │
-                 │                  │  │                │  │ realtimeAggregator  │
-                 │ NotificationClient──┼──► Redis Stream │  │ (WRITE candles),   │
-                 │ (XADD, drop-in)  │  │   notif:dispatch│ │ Angel auth OWNER    │
+                 │ billing, ~140    │  │ routes + crons │  │ WebSocket serving,  │
+                 │ admin routes,    │  │ FCM (Firebase) │  │ candle WRITING,     │
+                 │ GraphQL, trades, │  │ message-pipe   │  │ market scheduler,   │
+                 │ content          │  │ consumer       │  │ Angel login OWNER   │
+                 │                  │  │                │  │                     │
+                 │ NotificationClient──┼──► Redis Stream │  │                     │
+                 │ (tiny, drop-in)  │  │  notif:dispatch│  │                     │
                  │ Angel token      │  └───────┬────────┘  └──┬──────────────────┘
                  │ READER           │          │              │
                  └────────┬─────────┘          │              │
                           │                    │              │
         ┌─────────────────▼────────────────────▼──────────────▼───────────┐
-        │  PostgreSQL: victory_db + victory_market_db (shared, role-based)│
-        │  Redis: PRICE:LATEST:* / Order_Depth:* / ohlc:candle_close      │
-        │         / notif:dispatch (stream) / ANGEL:SESSION               │
+        │  PostgreSQL: victory_db + victory_market_db (shared, with clear │
+        │  "who owns which table" rules — see §9)                         │
+        │  Redis: PRICE:LATEST:* · notif:dispatch · ANGEL:SESSION         │
         └──────────────────────────────────────────────────────────────────┘
 
-   Strategy Engine :3003 — UNTOUCHED (already a separate service)
+   Strategy Engine :3003 — UNTOUCHED (it is already a separate service)
 ```
 
-Communication rules:
+How the services talk to each other:
 
-| From → To | Pattern | Mechanism | Why |
+| From → To | Style | Mechanism | Why |
 |---|---|---|---|
-| Clients → all services | Sync | HTTP/WS **through nginx only** | Frozen URLs, instant rerouting |
-| Monolith → Notif svc (paths 3/4/5 triggers) | **Async fire-and-forget** | Redis Stream `notif:dispatch` | Durable: if notif svc is down, messages wait and are processed on recovery — trade flow never blocks on FCM |
-| Admin panel → Notif svc (CRUD, send-now) | Sync | HTTP via nginx | Admin needs immediate response |
-| Live-data → everyone | Fire-and-forget | Redis keys (`PRICE:LATEST:*`) + WS broadcast | Already the contract today |
-| Monolith → Live-data (broker status) | Sync | Internal HTTP `/health` | Tiny, read-only |
-| Anything → Angel One login | **Only live-data svc** | — | Single-writer rule (§7.4) |
+| Clients → all services | direct request | HTTP/WebSocket **through nginx only** | URLs frozen forever, instant re-routing |
+| Monolith → Notif svc (trade/plan/expiry triggers) | **fire-and-forget message** | Redis Stream `notif:dispatch` | if the notif service is down, messages **wait safely** and are processed when it returns — the trade flow never gets stuck waiting for Firebase |
+| Admin panel → Notif svc (create/send/list) | direct request | HTTP via nginx | the admin needs an immediate answer |
+| Live-data → everyone | fire-and-forget | Redis keys + WebSocket broadcast | already the contract today |
+| Monolith → Live-data (broker status) | direct request | internal HTTP `/health` | tiny, read-only |
+| Anything → Angel One login | **only the live-data service** | — | single-owner rule (§8.5) |
+
+> **📘 New concept — "fire-and-forget":** the sender drops a message in a mailbox and continues its work immediately. It does not stand at the mailbox waiting for a reply. This is exactly right for notifications: a trade closing should never be delayed because Firebase is slow.
 
 ---
 
-<a name="5-gateway"></a>
-## 5. The gateway layer
+<a name="6-gateway"></a>
+## 6. The gateway (nginx) — the first and most important piece
 
-Deploy nginx **before any extraction**, routing 100% of traffic to the monolith. This is a pure pass-through with no behavior change, and it is the single highest-leverage step in the whole migration:
+> **📘 New concept — nginx (a "reverse proxy" / gateway):** a small, extremely fast and battle-tested program that sits at your public address and **forwards each request to the right server behind it**, based on the URL. Think of it as a hotel receptionist: every guest walks up to the same front desk, and the receptionist quietly directs them to the right room. The guests (your web app, your mobile app) never need to know the room numbers — and you can move things between rooms without telling any guest.
+>
+> ```
+>                              ┌──► room :3002  (monolith)
+>   all clients ──► reception ─┼──► room :3004  (live data)
+>                   (nginx)    └──► room :3005  (notifications)
+>
+>   Clients only ever know the reception desk's address.
+>   Moving a feature to a new room = telling the receptionist, not the guests.
+> ```
+>
+> nginx is free, runs everywhere (including Windows), handles WebSockets natively, and adds well under a millisecond of delay — your ticks already spend tens of milliseconds traveling the internet, so this cost is invisible.
 
-- **Zero client changes, forever.** Web and mobile keep one origin.
-- **Per-route canary.** Move `/api/notification-query` alone to the new service while everything else stays — impossible with "edit the frontend URL".
-- **Instant rollback.** Cutover and rollback are an upstream flip + `nginx -s reload` (sub-second, no deploys, no client involvement).
+We deploy nginx **before any extraction**, routing 100% of traffic to the monolith. Pure pass-through, zero behavior change — and it is the single highest-leverage step of the migration:
 
-Reference config (the two WS-specific settings are the ones people forget):
+- **Zero client changes, forever.** Web and mobile keep one address. (Remember §3.3: mobile URLs are frozen — this is the only honest way to respect that.)
+- **Per-route canary.** Move one small endpoint group to the new service while everything else stays put.
+- **Instant rollback.** Switch-over and rollback are a one-line change + reload (sub-second, no deploys, no client involvement).
+
+> **📘 New concept — canary release:** named after the canary birds miners took underground — a small early-warning test. Instead of moving *all* notification routes at once, we move the smallest, least risky group first and watch it for a day. If anything is wrong, only that tiny group was exposed, and we flip it back in seconds.
+
+Reference config (the two WebSocket settings are the ones people forget):
 
 ```nginx
 upstream monolith      { server 127.0.0.1:3002; }
@@ -387,15 +320,16 @@ upstream livedata_svc  { server 127.0.0.1:3004; }
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 
 server {
-    listen 80;  # add TLS in production
+    listen 80;  # add HTTPS/TLS in production
 
-    # WebSockets → live-data service (after Phase 3; before that, → monolith)
+    # WebSockets → live-data service (after Phase 3; before that → monolith)
     location ~ ^/ws/(prices|market)$ {
         proxy_pass http://livedata_svc;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
-        # MUST exceed the 30s server ping interval, or nginx kills idle sockets:
+        # MUST be longer than the server's 30s ping interval,
+        # or nginx will cut healthy idle connections:
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
     }
@@ -413,27 +347,27 @@ server {
         proxy_pass http://monolith;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        client_max_body_size 50m;   # monolith accepts 50mb JSON bodies today
+        client_max_body_size 50m;   # the monolith accepts 50 MB uploads today
     }
 }
 ```
 
 Notes:
-- Cookies pass through untouched (same origin → same cookie domain). JWT-in-cookie auth keeps working everywhere with zero changes.
-- If you later add a second live-data fan-out instance, native `ws` needs **no sticky sessions** (no socket.io handshake state); clients re-`SUBSCRIBE` on reconnect, which `marketWs.js` already does.
+- Login cookies pass through untouched (same address → same cookie rules). Authentication keeps working everywhere with zero changes.
+- If you later run a second live-data instance, plain WebSockets need no "sticky sessions" — clients simply re-subscribe on reconnect, which the frontend already does.
 
 ---
 
-<a name="6-notification-service"></a>
-## 6. Notification Service — corrected design
+<a name="7-notif"></a>
+## 7. Notification Service — full design
 
-### 6.1 What moves (Gemini's list, which was correct here)
+### 7.1 What moves to the new service
 
-`push.service.js`, `notificationBroadcast.service.js`, `autoNotification.service.js`, `autoNotificationCron.js`, the three notification controllers, the three notification route files, `config/firebase.js` + the service-account JSON, plus copies of `authenticateUser.js`, `authorizeAccess.js`, cookie-parser and the exact CORS config.
+`push.service.js`, `notificationBroadcast.service.js`, `autoNotification.service.js`, `autoNotificationCron.js`, the three notification controllers, the three notification route files, `config/firebase.js` + the Firebase service-account JSON — plus **copies** of `authenticateUser.js`, `authorizeAccess.js`, cookie-parser, and the exact same CORS settings.
 
-### 6.2 What the monolith KEEPS: the `NotificationClient` (the fix for Defects 1 & 2)
+### 7.2 What the monolith KEEPS: the `NotificationClient` (this protects Facts 1 & 2)
 
-A single new file in the monolith, exporting **the same function names with the same signatures** as the code being removed:
+One new small file in the monolith. It exports **the same function names with the same signatures** as the code that is moving out — so the business logic doesn't know anything changed:
 
 ```js
 // src/services/notificationClient.js  (stays in the monolith)
@@ -442,7 +376,7 @@ const { randomUUID } = require("crypto");
 
 async function dispatch(action, payload, correlationId) {
   await getRedis().xAdd("notif:dispatch", "*", {
-    action,                                  // e.g. "BROADCAST_BY_QUERY" | "PLAN_SYNC" | "USER_PLAN_SYNC"
+    action,                                  // "BROADCAST_BY_QUERY" | "PLAN_SYNC" | "USER_PLAN_SYNC"
     payload: JSON.stringify(payload),
     idempotency_key: payload.idempotencyKey || randomUUID(),
     correlation_id: correlationId || randomUUID(),
@@ -450,13 +384,22 @@ async function dispatch(action, payload, correlationId) {
   });
 }
 
-// Drop-in replacements — same names/signatures as the old in-process functions:
+// Drop-in replacements — same names and signatures as the old in-process functions:
 exports.broadcastNotificationByQuery = (args) => dispatch("BROADCAST_BY_QUERY", args);
 exports.notifyPlanChange            = (args) => dispatch("PLAN_SYNC", args);
 exports.notifyUserPlanChange        = (args) => dispatch("USER_PLAN_SYNC", args);
 ```
 
-Then exactly **four import lines change** in the monolith, and *no business logic changes at all*:
+> **📘 New concept — Redis Stream (the "message pipe"):** Redis is the in-memory data store you already run. A *Stream* is its built-in durable message queue: one side appends messages (`XADD`), the other side reads them in order. The key property: **if the reader is down, messages don't disappear — they wait in the pipe** until the reader comes back. That is exactly what notifications need.
+>
+> ```
+>   monolith ──XADD──►  ║▓▓▓▓▓░░░░║  ──XREADGROUP──► notification service
+>                        the pipe                       (reads, sends push,
+>                   (messages wait here                  then ACKnowledges)
+>                    if reader is down)
+> ```
+
+With this client in place, exactly **four import lines change** in the whole monolith — and *zero business logic*:
 
 | File | Old import | New import |
 |---|---|---|
@@ -465,24 +408,26 @@ Then exactly **four import lines change** in the monolith, and *no business logi
 | `controllers/proPlanTransactions.controller.js:90` | same | same |
 | `controllers/proPlanTransactions.controller.js:155` | same | same |
 
-`tradeExpireCron.js` needs no change — it goes through the controller.
+`tradeExpireCron.js` needs no change — it already goes through the controller.
 
-One behavioral nuance to accept and document: these triggers become **asynchronous** (enqueued, then sent by the service typically within milliseconds). For pushes to phones this is invisible — FCM delivery itself already takes seconds. None of the call sites read the send result for business decisions (they only `console.error` on failure — verify this during Phase 1 by checking each call site's use of the return value).
+One honest nuance: these triggers become *asynchronous* — the message is queued, then sent by the service typically within milliseconds. For phone pushes this is invisible (Firebase delivery itself takes seconds). None of the call sites use the send result for business decisions — they only log errors. (Verify this during Phase 1 by checking each call site.)
 
-### 6.3 The service side: stream consumer
+### 7.3 The service side: the consumer
+
+> **📘 New concept — consumer group + ACK:** a *consumer group* is Redis's way of letting one or more workers share a stream safely. A worker reads a message, processes it, then sends an **ACK** ("done"). If a worker crashes before ACKing, Redis keeps the message in a "pending" list and another worker can pick it up. Nothing is lost.
 
 ```js
-// Consumer loop (notification-service/src/consumers/dispatchConsumer.js)
-// XGROUP CREATE notif:dispatch notif_workers $ MKSTREAM   (once, at startup)
+// notification-service/src/consumers/dispatchConsumer.js
+// One-time setup: XGROUP CREATE notif:dispatch notif_workers $ MKSTREAM
 while (running) {
   const msgs = await redis.xReadGroup("notif_workers", consumerName,
       { key: "notif:dispatch", id: ">" }, { COUNT: 10, BLOCK: 5000 });
   for (const m of msgs) {
     try {
-      await handle(m);                      // routes on m.action → existing service functions
+      await handle(m);                      // routes on m.action → the existing service functions
       await redis.xAck("notif:dispatch", "notif_workers", m.id);
     } catch (err) {
-      // retry counter in the message / PEL delivery count; after 5 failures:
+      // after 5 failed attempts, park the message in the dead-letter stream:
       await redis.xAdd("notif:dispatch:dead", "*", { ...m, error: String(err) });
       await redis.xAck("notif:dispatch", "notif_workers", m.id);
       log.error({ correlationId: m.correlation_id }, "moved to DLQ");
@@ -491,13 +436,16 @@ while (running) {
 }
 ```
 
-- **At-least-once delivery** (crash before ACK ⇒ redelivery). That's why idempotency (next section) is mandatory, not optional.
-- A startup sweeper claims pending messages from dead consumers (`XAUTOCLAIM` with `min-idle-time` 60s).
-- The **DLQ stream** (`notif:dispatch:dead`) is monitored and alertable; a small admin endpoint can re-drive it.
+> **📘 New concept — DLQ (dead-letter queue):** a parking lot for messages that keep failing. Instead of retrying a broken message forever (and blocking everything behind it), we move it aside after 5 attempts, raise an alarm, and a human looks at it. No message is ever silently thrown away.
 
-### 6.4 Real idempotency (the fix for Error C)
+- Delivery guarantee is **at-least-once** (a crash before ACK means the message is delivered again). That is why the next section exists.
+- A startup sweeper (`XAUTOCLAIM`, idle > 60s) rescues messages stuck with a dead worker.
 
-Two database-level guarantees that make duplicate crons, redeliveries, and crash-retries all harmless:
+### 7.4 Real duplicate-protection (idempotency)
+
+> **📘 New concept — idempotency:** an operation is *idempotent* if doing it twice has the same effect as doing it once. Since our message pipe can deliver a message twice (at-least-once), the *receiver* must make duplicates harmless. We do it at the database level — the only level that cannot be bypassed by a bug, a crash, or a double-running cron.
+
+Two database-level guarantees:
 
 **1. Atomic claim before sending a scheduled notification:**
 
@@ -506,84 +454,117 @@ UPDATE notifications
 SET    status = 'PROCESSING', claimed_by = $1, claimed_at = now()
 WHERE  id = $2 AND status = 'PENDING'
 RETURNING id;
--- 0 rows returned ⇒ someone else claimed it ⇒ skip. Two crons are now harmless.
+-- 0 rows returned ⇒ someone else already claimed it ⇒ skip.
+-- Even two crons running at once cannot both claim the same row.
 ```
 
-A sweeper resets rows stuck in `PROCESSING` for >10 minutes back to `PENDING` (crash recovery), and the per-user constraint below prevents re-sends to users who already got it.
+A sweeper resets rows stuck in `PROCESSING` for more than 10 minutes back to `PENDING` (crash recovery); the constraint below stops re-sends to users who already received it.
 
-**2. Unique constraint as the duplicate firewall:**
+**2. A unique constraint as the duplicate firewall:**
 
 ```sql
--- Check for existing duplicates first; then:
 ALTER TABLE push_notifications
   ADD CONSTRAINT uq_push_notif_user UNIQUE (notification_id, user_id);
--- Sender does INSERT ... ON CONFLICT DO NOTHING and only pushes to FCM
--- for rows actually inserted.
+-- The sender does INSERT ... ON CONFLICT DO NOTHING, and only pushes to FCM
+-- for rows that were actually inserted.
 ```
 
-With these two in place, the feature flag stops being a safety mechanism and becomes what it should be: a convenience switch.
+With these two, a double-running cron or a re-delivered message produces **zero** duplicate pushes — by construction, not by hope.
 
-### 6.5 Cron ownership
+*(Both statements are run by your team, by hand, after a backup — see the database safety rules in §9.5.)*
 
-The every-minute scheduled-notification cron moves to the notification service. During transition, both processes *may* run it — the DB claim makes that safe. Keep the new boxes/containers on **Asia/Kolkata** time or rely on the code's explicit IST conversion (verify which it is before cutover); a UTC server clock would shift every scheduled notification by 5.5 hours.
+### 7.5 Cron ownership
+
+> **📘 New concept — cron:** a scheduler that runs a task on a fixed timetable (e.g., "every minute", "8:45 every weekday"). Your system already uses `node-cron` for scheduled notifications, backups, and token refresh.
+
+The every-minute scheduled-notification cron moves to the notification service. During the transition both processes *may* briefly run it — the database claim above makes that completely harmless. One operational must: the new service's machine must be on **Asia/Kolkata** time (or the code's explicit IST conversion must be verified) — a UTC clock would shift every scheduled notification by 5.5 hours.
+
+### 7.6 The service's public API (unchanged paths — nginx makes that possible)
+
+All existing paths stay byte-identical: `/api/notification/send`, `/api/notification/getNotificationUserWise`, `mark-delivered`, `mark-opened`, delete, the admin CRUD under `/api/notifications/`, and the saved-targeting-queries CRUD under `/api/notification-query/`. The frontend and the mobile app notice **nothing**.
 
 ---
 
-<a name="7-live-data-service"></a>
-## 7. Live Data Service — corrected design
+<a name="8-livedata"></a>
+## 8. Live Data Service — full design
 
-### 7.1 The complete move list (corrected)
+### 8.1 The complete move list
 
-**Moves to live-data service:**
+**Moves to the live-data service:**
 
 | Component | Note |
 |---|---|
 | `sockets/` — all 8 files | wsHub, priceSocket, index, internalMarket.websocket + instance, angelOne instance, sharekhan ×2 |
 | `core/` — all 6 files | BaseBrokerWS, BrokerManager, BrokerRegistry, TickGate, MessageNormalizer, MarketScheduler |
 | `brokers/dhan/` — all 4 files | self-contained |
-| `services/marketData/angelAuth.service.js`, `angelLoginRunner.js`, `angelTokenScheduler.js`, `angelWebSocket.service.js`, `angelWebSocket.service.v2.js` | live-data svc becomes the **only** process that logs in to Angel One |
-| **`services/marketData/realtimeAggregator.service.js`** | **Gemini missed it. Moves with a WRITE pool** (Defect 3) |
-| `services/marketData/tickGenerator.service.js` | verify its consumers first; if it synthesizes ticks into the same pipeline, it moves |
-| `config/brokerConfig.js`, `script/syncAngelOneTokens.js`, the 8:45 AM token cron from `index.js` | token lifecycle moves as one unit |
-| `db/redisClient.js`, `db/timescaleClient.js` (copies) | own connections |
+| `services/marketData/angelAuth.service.js`, `angelLoginRunner.js`, `angelTokenScheduler.js`, `angelWebSocket.service.js`, `angelWebSocket.service.v2.js` | the live-data service becomes the **only** process that logs in to Angel One |
+| **`services/marketData/realtimeAggregator.service.js`** | the candle writer — moves with the tick path and gets a **read/write** DB pool (Fact 3) |
+| `services/marketData/tickGenerator.service.js` | verify its consumers first; if it feeds the same pipeline, it moves |
+| `config/brokerConfig.js`, `script/syncAngelOneTokens.js`, and the 8:45 AM token cron from `index.js` | the token lifecycle moves as one unit |
+| copies of `db/redisClient.js`, `db/timescaleClient.js` | own connections |
 
-**Stays in the monolith (read-side market features):**
+**Stays in the monolith (these only READ market data):**
 
 | Component | Why it stays |
 |---|---|
-| `intervals.controller.js` + `intervalCandles.service.js` | reads candles from DB (verify: read-only) |
-| `history.controller.js` + `historyAggregation.service.js` | reads/aggregates candles from DB |
-| `movers.controller.js` + `movers.service.js` | reads DB/Redis |
-| `price.controller.js` + `price.service.js` | reads Redis `PRICE:LATEST:*` |
-| `indices.controller.js` + `indexCalculation.service.js` | reads Redis |
-| `angel.service.js` | historical-candle REST — **needs the token-reader refactor (§7.4)** |
-| `broker.controller.js` | **becomes a proxy (§7.5)** |
-| chart/sparkline/symbols/trading routes | DB reads |
+| `intervals.controller.js`, `history.controller.js`, `movers.controller.js` + their services | read candles from the database |
+| `price.controller.js` + `price.service.js` | read `PRICE:LATEST:*` from Redis |
+| `indices.controller.js` + `indexCalculation.service.js` | read Redis |
+| `angel.service.js` | historical candles — needs the token-reader adapter (§8.5) |
+| `broker.controller.js` | becomes a proxy (§8.6) |
+| chart/sparkline/symbols/trading routes | database reads |
 
-**Decide before moving (likely dead):** `services/smartapiStream.js` — required by nothing. Phase 0 determines whether order-depth is a live feature; if dead, it is deleted, not migrated.
+**Decide before moving:** `services/smartapiStream.js` — see Fact 6. If order-depth is dead, this file is deleted, not migrated.
 
-### 7.2 Contracts to freeze (write these down before touching anything)
+The dividing line, in one sentence: **everything fed by live ticks moves; everything that only reads stored results stays.**
 
-These five contracts are what "nothing breaks" *means*. Capture real samples of each (golden files) in Phase 0 and diff against them at every step:
+### 8.2 The frozen contracts (this is what "nothing breaks" *means*)
 
-1. **`/ws/prices` frames:** `{ "type": "price", "data": {...} }` and `{ "type": "depth", "data": {...} }` — broadcast to all clients, no subscription needed.
-2. **`/ws/market` protocol:** client sends `{ type: "SUBSCRIBE", page, context, symbols[] }` / `{ type: "UNSUBSCRIBE_DELAYED", ... }` (30s grace); server sends `{ type: "PRICE", symbol, ...payload }` plus Redis snapshots immediately on subscribe; only symbols enabled in `InternalTokenList.websocket_enabled` are broadcast.
-3. **Redis keys:** `PRICE:LATEST:{symbol}` — exact JSON shape, 60s TTL; `Order_Depth:{token}` 24h TTL (if alive).
-4. **TimescaleDB writes:** 1-min candle rows exactly as `insert1MinCandle` produces them today (same table, same conflict handling per Migration 028).
-5. **Auth:** both WS endpoints are unauthenticated today. Preserve that (market data is public); do not "improve" it mid-migration.
+Write these down, record real samples of each in Phase 0 (golden files), and compare at every later step:
 
-### 7.3 Internal scaling seam (cheap now, priceless later)
+1. **`/ws/prices` messages:** `{ "type": "price", "data": {...} }` and `{ "type": "depth", "data": {...} }` — broadcast to every connected client.
+2. **`/ws/market` protocol:** client sends `{ type: "SUBSCRIBE", page, context, symbols[] }` / `{ type: "UNSUBSCRIBE_DELAYED", ... }` (30-second grace period); server replies with Redis snapshots immediately, then live `{ type: "PRICE", symbol, ... }` messages; only symbols enabled in `InternalTokenList.websocket_enabled` are broadcast.
+3. **Redis keys:** `PRICE:LATEST:{symbol}` — exact same JSON shape, same 60s expiry. (`Order_Depth:{token}` only if Fact 6 says it's alive.)
+4. **Database writes:** 1-minute candle rows exactly as `insert1MinCandle` produces them today — same table, same conflict handling.
+5. **Auth:** both WebSocket endpoints are open (no login) today. Keep that — market prices are public data; do not "improve" security mid-migration.
 
-Inside the new service, in addition to the existing in-process `pushPrice`/`broadcastPrice` calls, `BrokerManager._onTick` also `PUBLISH`es accepted ticks to a Redis channel `ticks:validated` (behind a flag, off by default). Cost: one line and one Redis publish per tick. Benefit: when one fan-out process is no longer enough, you can run N stateless "edge" WS instances that subscribe to `ticks:validated` — without ever touching broker ingest code again. Broker connections themselves must always be a **single instance** (broker sessions are singletons), so this ingest/fan-out split is the only honest horizontal-scaling story for this system.
+### 8.3 A built-in path to future scaling (cheap now, priceless later)
 
-### 7.4 Angel One token: single-writer rule (the fix for Defect 4)
+Broker connections must always be a **single instance** — a broker session is a singleton; you cannot run it twice (see §8.4). So the only honest way to scale is to split *receiving* ticks from *distributing* ticks:
 
-- **Owner:** live-data service runs `AngelAuthService.login()`, the token scheduler, and the 8:45 AM IST refresh cron. Nobody else ever logs in with the system credentials.
-- **Publication:** after each login/refresh, the service writes the session/feed tokens where they already live today (the credentials table) **and** mirrors them to Redis `ANGEL:SESSION` (with TTL) for cheap reads.
-- **Monolith change:** `angel.service.js:2` swaps `require('./marketData/angelAuth.service.js')` for a ~20-line `angelTokenReader.js` that reads the token from Redis/DB and never refreshes. If a monolith call gets a 401 from Angel One, it re-reads the token (the owner will have refreshed it) — it must **not** trigger a login itself.
-- Per-user broker tokens (the `save-token` / place-order flows) are unrelated to this — they are user-supplied sessions and stay in the monolith untouched (verified: `angelOne.controller.js` does not use `AngelAuthService`).
+```
+                          single instance                many instances (future)
+   BROKERS ──► [ INGEST: broker connections,    ──►  [ FAN-OUT: WebSocket
+                 TickGate, candle writing ]            servers for clients ]
+                        │                                      ▲
+                        └── Redis publish "ticks:validated" ───┘
+```
 
-### 7.5 `broker.controller.js` becomes a proxy
+We prepare this seam now at almost zero cost: inside the new service, `BrokerManager._onTick` *additionally* publishes each accepted tick to a Redis channel `ticks:validated` (behind a switch, off by default — one line, one Redis publish). Today, one process does both jobs, exactly like now. The day one fan-out process is not enough, you start more — without ever touching the broker code again.
+
+### 8.4 The Angel One login: the single-owner rule (this protects Fact 4 and prevents session wars)
+
+**Why this matters:** if two processes log in to Angel One with the same system credentials, each new login invalidates the other's session — they knock each other offline in a loop. This is also why this plan never "dual-runs" broker connections for testing.
+
+```
+   THE SINGLE-OWNER RULE
+
+   live-data service  ──── logs in / refreshes (8:45 cron) ───► Angel One
+        │
+        └── writes the fresh token to:  credentials table  +  Redis ANGEL:SESSION
+
+   monolith (angel.service.js) ──── READS the token only ──── never logs in
+```
+
+- **Owner:** the live-data service runs `AngelAuthService.login()`, the token scheduler, and the 8:45 AM IST refresh cron. Nobody else ever logs in with system credentials.
+- **Monolith change:** `angel.service.js:2` swaps its import for a ~20-line `angelTokenReader.js` that reads the token from Redis/DB. If a monolith call gets a 401 from Angel One, it re-reads the token (the owner will have refreshed it) — it must **never** trigger a login itself.
+- Per-user broker tokens (the `save-token` / place-order flows) are a different thing — they are user-supplied sessions and stay in the monolith untouched (verified: `angelOne.controller.js` does not use `AngelAuthService`).
+
+### 8.5 The token-reader adapter (the Fact-4 fix, ~20 lines)
+
+Shipped to the monolith *before* switch-over day, switched on by the `LIVE_DATA_EXTRACTED` flag.
+
+### 8.6 The broker-status proxy (the Fact-5 fix)
 
 ```js
 // monolith: controllers/broker.controller.js (after Phase 3)
@@ -593,73 +574,79 @@ exports.getBrokerStatus = async (req, res) => {
 };
 ```
 
-Two seconds of work in the live-data service to expose the same shape `getBrokerManager().getHealth()` returns today; the admin panel sees an identical response.
+The live-data service exposes the same shape `getBrokerManager().getHealth()` returns today, so the admin panel sees an identical response.
 
-### 7.6 Backpressure guard (one line, prevents the classic WS memory blowup)
+### 8.7 The slow-client guard (one line that prevents a classic crash)
+
+> **📘 New concept — backpressure:** if one client's network is slow, the server's send buffer for that client grows and grows. With thousands of ticks, an unchecked buffer can eat all the server's memory and crash it — taking everyone down because of one bad connection.
 
 ```js
 // in every broadcast loop:
-if (ws.bufferedAmount > 1_000_000) return;  // skip slow client; next tick supersedes this one anyway
+if (ws.bufferedAmount > 1_000_000) return;  // skip this slow client;
+                                            // the next tick supersedes this one anyway
 ```
 
-Price ticks are last-value-wins by nature — skipping a tick to a stalled client is strictly better than buffering unbounded memory until the process dies.
+Price ticks are "last value wins" by nature — skipping one tick to a stalled client is strictly better than buffering until the process dies.
 
 ---
 
-<a name="8-data-ownership"></a>
-## 8. Database, Redis, and "who owns what"
+<a name="9-data"></a>
+## 9. Databases, Redis, and the "who owns what" rules
 
-### 8.1 Corrected ownership table
+### 9.1 Ownership table (one writer per thing — always)
 
-| Store / resource | Single writer | Readers | Gemini's version | Correction |
-|---|---|---|---|---|
-| `OHLC_*` 1-min candles (victory_market_db) | **Live-data svc** (realtimeAggregator) | Monolith (charts/history/movers), Strategy Engine | "live-data is read-only" | **WRITE pool required** |
-| `PRICE:LATEST:{symbol}` (Redis) | Live-data svc | Monolith REST, internal WS | ✅ same | — |
-| `Order_Depth:{token}` (Redis) | smartapiStream *(if alive)* | indexCalculation | listed as live | verify; likely dead |
-| Angel system session (credentials table + `ANGEL:SESSION`) | **Live-data svc only** | Monolith `angel.service` (reader) | not addressed | single-writer rule |
-| `notifications`, `push_notifications`, `push_devices`, `notification_types`, `notification_query` | Notif svc | Notif svc (monolith only via stream) | ✅ same | + unique constraint, + claim column |
-| `notif:dispatch` / `notif:dispatch:dead` (Redis Streams) | Monolith produces / Notif svc consumes | — | dispatch only | + DLQ |
-| `InternalTokenList`, `control_tradingdays` | Monolith (admin UI writes) | Live-data svc polls (30s / 15s) | ✅ same | — |
-| `users`, permissions, billing, content tables | Monolith | Notif svc reads `users` for targeting | ✅ same | targeting via read-only role (§8.4) |
+> **📘 New concept — single-writer rule:** for every table and every Redis key, exactly **one** service is allowed to write it. Everyone else may only read. This removes a whole category of bugs (two services overwriting each other) without splitting any database.
 
-### 8.2 Connection-pool budget
+| Store / resource | The one writer | Readers |
+|---|---|---|
+| `OHLC_*` 1-min candles (victory_market_db) | **Live-data svc** (realtimeAggregator) | Monolith (charts/history/movers), Strategy Engine |
+| `PRICE:LATEST:{symbol}` (Redis) | Live-data svc | Monolith REST, WebSocket layer |
+| Angel system session (credentials table + `ANGEL:SESSION`) | **Live-data svc only** | Monolith `angel.service` (read-only) |
+| `notifications`, `push_notifications`, `push_devices`, `notification_types`, `notification_query` | Notification svc | (monolith only writes via the message pipe) |
+| `notif:dispatch` / `notif:dispatch:dead` (Redis Streams) | Monolith produces / Notif svc consumes | — |
+| `InternalTokenList`, `control_tradingdays` | Monolith (admin UI writes) | Live-data svc polls them (30s / 15s) |
+| `users`, permissions, billing, content tables | Monolith | Notif svc reads `users` for targeting (read-only role, §9.4) |
 
-| Service | victory_db | victory_market_db | Rationale |
+### 9.2 Connection-pool budget
+
+> **📘 New concept — connection pool:** each service keeps a small set of reusable database connections (a "pool") instead of opening a new one per query. PostgreSQL allows ~100 connections total by default — so when several services share one database, their pool sizes must be budgeted like a household budget.
+
+| Service | victory_db | victory_market_db | Reasoning |
 |---|---|---|---|
 | Monolith | 20 | 15 | unchanged primary writer |
 | Notification svc | 5 | — | low write volume |
-| Live-data svc | — | **10 read/write** | parallel candle inserts (the aggregator's actual behavior), plus polling reads |
+| Live-data svc | — | **10 read/write** | parallel candle inserts + polling reads |
 | Strategy Engine | — | 20 | unchanged |
-| **Total** | 25 | 45 | comfortably under PG's default 100 |
+| **Total** | 25 | 45 | comfortably under the ~100 limit |
 
-### 8.3 Why the DB stays shared (agreeing with Gemini, explicitly)
+### 9.3 Why the databases stay shared (a deliberate choice)
 
-Splitting databases during extraction would force dual-writes, data migration, and cross-service JOIN replacements — three large risk multipliers — for zero functional gain. Shared DB with **enforced single-writer-per-table rules** (above) gives you the operational benefit (clear ownership) without the migration risk. Revisit a physical split only after both services have been stable for a quarter.
+Splitting databases during a service extraction would force data migration, double-writing periods, and replacing cross-table JOINs — three big risk multipliers — for zero functional gain. A shared database **with enforced single-writer rules** (§9.1) gives the real benefit (clear ownership) without the risk. Revisit a physical split only after both services have been stable for a quarter.
 
-### 8.4 Security fix at the boundary: the SQL-targeting queries
+### 9.4 A security fix that comes free with the extraction
 
-`notification_query` rows are **raw SQL executed by the server** — that's SQL-injection-by-design if anyone with admin access (or a compromised admin account) can edit them. While extracting, run those queries through a dedicated PG role:
+The `notification_query` table stores **raw SQL that the server executes** to choose notification recipients. Today those queries run with full database privileges — meaning a bad or malicious saved query could, in theory, do anything. While extracting, we give the notification service a second, locked-down database login used *only* for these targeting queries:
 
 ```sql
-CREATE ROLE notif_targeting LOGIN PASSWORD '...' ;
+CREATE ROLE notif_targeting LOGIN PASSWORD '...';
 GRANT SELECT ON users, push_devices /* + whatever targeting needs */ TO notif_targeting;
 ALTER ROLE notif_targeting SET statement_timeout = '5s';
 ALTER ROLE notif_targeting SET default_transaction_read_only = on;
 ```
 
-The notification service uses **two** pools: the normal one for its own tables, and this locked-down one *exclusively* for executing targeting queries. A malicious or broken query can now read user emails at worst — it can no longer `DROP TABLE` or lock the database. This costs ~an hour and removes the single scariest thing in this codebase.
+Now the worst a bad targeting query can do is read some user rows slowly for 5 seconds. It can no longer modify or delete anything. This costs about an hour and removes the single scariest thing in the codebase.
 
-### 8.5 Database safety rules (read this before touching anything)
+### 9.5 Database safety rules (read this before touching anything)
 
 **Rule zero: no query in this plan is ever run automatically.** No AI tool, no script, no migration step executes SQL against your database on its own. Every statement below is run **by a human on your team**, in the listed phase, **after taking a backup** (`pg_dump` of `victory_db`), in a quiet window.
 
-The entire migration needs only **three** SQL statements — all of them *additive* (they only ADD things; they are physically incapable of losing data):
+The entire migration needs only **three** SQL statements — all *additive* (they only ADD things; they are physically incapable of losing data):
 
 | # | Statement (defined in) | What it does | Can it lose data? |
 |---|---|---|---|
-| 1 | `ALTER TABLE notifications ADD COLUMN claimed_by …, claimed_at …` (§6.4) | adds two empty bookkeeping columns | No — adding columns never touches existing rows |
-| 2 | `ALTER TABLE push_notifications ADD CONSTRAINT uq_push_notif_user UNIQUE (notification_id, user_id)` (§6.4) | adds a duplicate-blocker for the future | No — it only *refuses future duplicates*. If old duplicates already exist, it simply **fails to apply, harmlessly**, and changes nothing |
-| 3 | `CREATE ROLE notif_targeting … GRANT SELECT …` (§8.4) | creates a new **read-only** database login | No — it creates something new and touches nothing existing |
+| 1 | `ALTER TABLE notifications ADD COLUMN claimed_by …, claimed_at …` (§7.4) | adds two empty bookkeeping columns | No — adding columns never touches existing rows |
+| 2 | `ALTER TABLE push_notifications ADD CONSTRAINT uq_push_notif_user UNIQUE (notification_id, user_id)` (§7.4) | adds a duplicate-blocker for the future | No — it only *refuses future duplicates*. If old duplicates already exist, it simply **fails to apply, harmlessly**, and changes nothing |
+| 3 | `CREATE ROLE notif_targeting … GRANT SELECT …` (§9.4) | creates a new **read-only** database login | No — it creates something new and touches nothing existing |
 
 **About old duplicates (statement 2):** if `push_notifications` already contains duplicate rows, **do not delete them directly**. The safe order, done by hand:
 
@@ -669,25 +656,30 @@ The entire migration needs only **three** SQL statements — all of them *additi
 
 This plan deliberately does **not** provide a delete script — that decision and that keystroke must stay with your team.
 
-**Runtime queries are a different thing (and nothing new):** the notification service's claim query (`UPDATE notifications SET status='PROCESSING' …`) is something the *application* runs while operating — exactly the way today's code already runs `UPDATE … SET status='SENT'`. It touches only the `notifications.status` bookkeeping column, never user data, and it is the same kind of query your system executes every minute right now.
+**Runtime queries are a different thing (and nothing new):** the notification service's claim query (`UPDATE notifications SET status='PROCESSING' …`) is something the *application* runs while operating — exactly the way today's code already runs `UPDATE … SET status='SENT'`. It touches only the `notifications.status` bookkeeping column, never user data, and your system already executes this kind of query every minute right now.
 
 ---
 
-<a name="9-auth"></a>
-## 9. Authentication
+<a name="10-auth"></a>
+## 10. Authentication
 
-- **JWT verification is replicated, never proxied.** Notification service gets copies of `authenticateUser.js` + `authorizeAccess.js` + `cookie-parser`, and verifies with the same `JWT_SECRET` read from environment (move the hardcoded `victory_secret_key_123` and the session secret `secretKey1234` into env files during Phase 4 — and rotate them, since they've been in git).
-- **Sessions stay monolith-only.** `express-session` + FileStore (`./sessions` on local disk) never leaves the monolith. Before cutover, verify no notification controller touches `req.session` (they appear to use JWT via `authenticateUser` — confirm with a grep for `req.session` in the three notification controllers).
-- **CORS must match exactly.** The monolith runs `cors({ origin: true, credentials: true })`. The notification service must replicate this initially — same-but-different CORS is a classic source of "works in Postman, breaks in browser." Tighten to an explicit origin allowlist in Phase 4, all services at once.
-- **WS endpoints stay unauthenticated** (their current contract; market prices are public data).
-- **Internal endpoints** (live-data `/health` details, DLQ re-drive) bind to localhost/VPC or require a shared internal header token — they should not be reachable through nginx.
+- **JWT verification is copied, never proxied.** The notification service gets copies of `authenticateUser.js` + `authorizeAccess.js` + cookie-parser, and verifies tokens with the same `JWT_SECRET`, read from environment variables. (The secret is currently hardcoded in the codebase — move it to env files in Phase 4 and **rotate it**, since it has lived in git.)
+
+> **📘 New concept — "copied, never proxied":** each service checks the user's login token *itself*, using the same shared secret — it never forwards the request to another service to ask "is this user OK?". This keeps every request fast and means no service depends on another one just to answer "who is this?".
+
+- **Sessions stay monolith-only.** The `express-session` file store (`./sessions` on local disk) never leaves the monolith. Before switch-over, verify no notification controller touches `req.session` (they appear to use JWT — confirm with a quick search).
+- **CORS must match exactly.** The monolith currently allows `origin: true, credentials: true`. The notification service must copy this exactly at first — "almost the same" CORS is a classic source of *works in Postman, fails in the browser*. Tighten both to a real allowlist in Phase 4, together.
+- **WebSocket endpoints stay open (no login)** — that is their contract today, and market prices are public data.
+- **Internal endpoints** (detailed health, DLQ tools) bind to localhost/private network or require an internal header token — they are never reachable through nginx.
 
 ---
 
-<a name="10-phases"></a>
-## 10. The phased migration plan
+<a name="11-phases"></a>
+## 11. The migration, phase by phase
 
-Every phase ends with the system fully working, and every step's rollback is listed. **No step deletes code until the final phase.**
+Every phase ends with the system fully working. Every step lists its undo. **No step deletes code until the final phase.**
+
+> **📘 New concept — feature flag (a "switch"):** a setting (usually an environment variable like `NOTIF_VIA_STREAM=true/false`) that turns a code path on or off **without redeploying**. Flags are how every risky step in this plan becomes instantly reversible.
 
 ### Phase 0 — Safety net (week 1). No behavior change.
 
@@ -704,13 +696,13 @@ Mobile App  ────► :3002 monolith         Mobile App  ──► nginx �
                                           now, which we only TURN in later phases.
 ```
 
-| # | Action | Rollback |
+| # | Action | Undo |
 |---|---|---|
-| 0.1 | **Deploy nginx routing 100% → monolith.** Point clients/DNS at it. Verify both WS endpoints work *through the proxy* (watch for the 30s-ping vs `proxy_read_timeout` interaction). | Point DNS back at :3002 |
-| 0.2 | **Capture golden traffic:** log a full market day of `/ws/prices` and `/ws/market` frames to files; snapshot sample responses of every REST endpoint that will move; dump example `PRICE:LATEST:*` values and candle rows. These are your contract fixtures. | n/a |
-| 0.3 | Add `/health` + `/ready` to the monolith. | remove |
-| 0.4 | Write integration tests for **all five notification paths** (§3.1 — especially trade auto-exit and plan-sync, the ones Gemini didn't know existed), plus tick delivery, subscribe/unsubscribe, and candle insert. | n/a |
-| 0.5 | **Settle the dead-code question:** is `smartapiStream` / order-depth live anywhere? Is `Order_Depth:*` ever written in prod Redis? Decide: delete or migrate. Also confirm which DB `control_tradingdays` lives in, and whether any notification controller uses `req.session`. | n/a |
+| 0.1 | **Deploy nginx routing 100% → monolith.** Point clients/DNS at it. Verify both WebSocket endpoints work *through* the proxy (watch the 30s-ping vs `proxy_read_timeout` interaction). | point DNS back at :3002 |
+| 0.2 | **Record the golden files:** a full market day of `/ws/prices` and `/ws/market` messages; sample responses of every REST endpoint that will move; example `PRICE:LATEST:*` values and candle rows. | n/a |
+| 0.3 | Add `/health` + `/ready` endpoints to the monolith. | remove them |
+| 0.4 | Write integration tests for **all five notification paths** (§3.1 — especially trade auto-exit and plan-sync), plus tick delivery, subscribe/unsubscribe, and candle inserts. | n/a |
+| 0.5 | **Settle the open questions:** is `smartapiStream`/order-depth alive anywhere (Fact 6)? Do any notification controllers use `req.session`? Which database holds `control_tradingdays`? Decide: delete or migrate. | n/a |
 
 ### Phase 1 — Seams inside the monolith (week 2). Still one process.
 
@@ -724,9 +716,9 @@ WHAT PHASE 1 CHANGES  (still ONE process — no new servers exist yet)
 │        ▼                                                              │
 │  NotificationClient   ← new thin file, SAME function names as before  │
 │        │                                                              │
-│        ├─ flag OFF → calls the old functions directly (today's path)  │
+│        ├─ switch OFF → calls the old functions directly (today's path)│
 │        │                                                              │
-│        └─ flag ON  → writes a message into the Redis Stream ──────────┼──► Redis
+│        └─ switch ON  → writes a message into the Redis Stream ────────┼──► Redis
 │                                                                       │     │
 │   in-process consumer reads the stream back ◄─────────────────────────┼─────┘
 │        │                                                              │
@@ -736,22 +728,20 @@ WHAT PHASE 1 CHANGES  (still ONE process — no new servers exist yet)
 
 WHY: we prove the "message pipe" works in real production for several days,
 while everything still lives safely inside one process. If anything is off,
-flip the flag back (seconds) and you are on today's exact path again.
+flip the switch back (seconds) and you are on today's exact path again.
 ```
 
-| # | Action | Rollback |
+| # | Action | Undo |
 |---|---|---|
-| 1.1 | Add `notificationClient.js`; switch the 4 import sites (§6.2) to it. Behind flag `NOTIF_VIA_STREAM=false` it calls the old functions directly — **zero behavior change on day one**. | flip flag / revert imports |
-| 1.2 | **Run the stream loop inside the monolith:** with `NOTIF_VIA_STREAM=true`, the monolith XADDs to `notif:dispatch` *and* consumes its own stream in-process, calling the same old functions. This proves the message schema, claim logic, retries, and DLQ **with zero new processes and zero network hops**. Soak for several days. | flip flag |
-| 1.3 | DB groundwork: dedupe-check then add `uq_push_notif_user`; add `claimed_by/claimed_at` columns; deploy the claim-based cron logic (still in the monolith). | drop constraint/columns |
-| 1.4 | Diff all golden-contract fixtures — must be byte-identical. | — |
-
-> Why 1.2 matters: the Gemini plan's first network split was also its first test of the async path. Here, by the time a second process exists, the async machinery has already run in production for days.
+| 1.1 | Add `notificationClient.js`; switch the 4 import sites (§7.2). With `NOTIF_VIA_STREAM=false` it calls the old functions directly — **zero behavior change on day one**. | flip switch / revert imports |
+| 1.2 | Turn the switch on: the monolith writes to `notif:dispatch` **and consumes its own stream in-process**, calling the same old functions. This proves the message format, the claim logic, retries, and the DLQ — with zero new processes and zero network hops. Run it for several days. | flip the switch |
+| 1.3 | Database groundwork (run by hand, §9.5): duplicate-check, then the unique constraint; the two claim columns; deploy the claim-based cron logic (still inside the monolith). | drop constraint/columns |
+| 1.4 | Compare all golden files — must be identical. | — |
 
 ### Phase 2 — Notification service extraction (weeks 3–4).
 
 ```
-STEP 2.2 — move routes ONE SMALL GROUP at a time (nginx canary)
+STEP 2.2 — move routes ONE SMALL GROUP at a time (the canary)
 
                         ┌──► :3005  notification service (new)
    clients ──► nginx ───┤
@@ -778,20 +768,20 @@ monolith ──► [stream] ──► monolith's      monolith ──► [stream
                               ▼                                          ▼
                           FCM push                                   FCM push
 
-Exactly ONE consumer is active at a time (controlled by two flags).
-And even if both accidentally ran together, the database claim (§6.4)
-makes a double-send IMPOSSIBLE — that is lock-level safety, not flag-level hope.
+Exactly ONE consumer is active at a time (controlled by two switches).
+And even if both accidentally ran together, the database claim (§7.4)
+makes a double-send IMPOSSIBLE — that is lock-level safety, not switch-level hope.
 ```
 
-| # | Action | Rollback |
+| # | Action | Undo |
 |---|---|---|
-| 2.1 | Stand up `notification-service` on :3005 (moved code, own pools, copied auth/CORS, Firebase JSON, IST timezone). Stream consumer **off**, cron **off**, REST **on**. | stop process |
-| 2.2 | **Canary by route group via nginx**, lowest-risk first: (a) `/api/notification-query` → :3005, watch a day; (b) `/api/notifications` admin CRUD; (c) user-feed endpoints (**mobile-facing — watch 4xx/5xx rates closely here**); (d) `/api/notification/send*`. | flip the nginx line back (sub-second) |
-| 2.3 | **Flip the consumer:** monolith in-process consumer off, service consumer on (flags). Trade auto-exit, expiry, and plan-sync pushes now flow monolith → stream → service → FCM. Run the Phase-0.4 integration tests for paths 3/4/5 specifically. | flip both flags back |
-| 2.4 | **Flip the cron** to the service. Double-running during the overlap is harmless because of the DB claim. | flip back |
-| 2.5 | **Bake 2 weeks.** Monolith's notification code is dormant behind flags but deployable in minutes. Then — and only then — delete it and the monolith's Firebase JSON. | (after deletion) git revert |
+| 2.1 | Start `notification-service` on :3005 (moved code, own pools, copied auth/CORS, Firebase JSON, IST timezone). Stream consumer **off**, cron **off**, REST **on**. | stop the process |
+| 2.2 | **Canary by route group via nginx**, lowest-risk first (diagram above). | flip the nginx line back (seconds) |
+| 2.3 | **Flip the consumer:** monolith's in-process consumer off, the service's consumer on. Trade auto-exit, expiry, and plan-sync pushes now flow monolith → pipe → service → FCM. Re-run the Path 3/4/5 tests from Phase 0.4. | flip both switches back |
+| 2.4 | **Flip the cron** to the service. A brief overlap is harmless thanks to the database claim. | flip back |
+| 2.5 | **Bake for 2 weeks.** The monolith's notification code sleeps behind switches but stays deployable in minutes. Then — and only then — delete it and the monolith's Firebase JSON. | (after deletion) git revert |
 
-### Phase 3 — Live data extraction (weeks 5–7). The hard one — but without dual-run.
+### Phase 3 — Live data extraction (weeks 5–7). The hard one — done without ever dual-running.
 
 ```
 STEP 3.1 — test the new WebSocket layer on REAL live data, with ZERO user risk
@@ -810,151 +800,191 @@ STEP 3.1 — test the new WebSocket layer on REAL live data, with ZERO user risk
 ```
 
 ```
-STEP 3.4 — the cutover, on a weekend evening
+STEP 3.4 — the switch-over, on a weekend evening
             (market CLOSED  =  zero live ticks anywhere  =  nothing can be missed)
 
    ①  monolith:   BROKERS_ENABLED=false  → restart
-        └── monolith stops talking to Angel One / Dhan completely
+        └── the monolith stops talking to Angel One / Dhan completely
    ②  live-data:  BROKERS_ENABLED=true
-        └── live-data service logs in to Angel One —
+        └── the live-data service logs in to Angel One —
             it is now the ONLY process anywhere that logs in
    ③  nginx:      /ws/prices + /ws/market  → :3004     (one reload, sub-second)
    ④  monolith:   LIVE_DATA_EXTRACTED=true
         └── the Angel token-reader and broker-status proxy switch on
 
-   ROLLBACK = do ④ ③ ② ① in reverse. Under 5 minutes,
+   UNDO = do ④ ③ ② ① in reverse. Under 5 minutes,
    still inside the closed window — users never see a thing.
-   (And because nothing ever dual-runs, rollback has no session conflicts either.)
+   (And because nothing ever dual-runs, the undo has no session conflicts either.)
 ```
 
-| # | Action | Rollback |
+| # | Action | Undo |
 |---|---|---|
-| 3.1 | Stand up `live-data-service` on :3004 with the **corrected move list** (§7.1) and **brokers disabled by flag**. It serves both WS endpoints and answers `SUBSCRIBE` with Redis snapshots — which still come from the monolith's ticks via shared Redis. This validates the entire WS/subscription layer against **live production data** while the monolith still owns ingest. Test via a parallel nginx path (`/ws-canary/prices`) or a test client pointed at :3004 directly. | stop process |
-| 3.2 | **Replay validation in staging:** pipe the Phase-0.2 golden tick recordings through the service's full pipeline (TickGate → aggregator → broadcast). Diff produced candle rows and WS frames against fixtures. This replaces Gemini's impossible "dual-run parity comparison" with a deterministic one. | n/a |
-| 3.3 | Ship the two monolith-side changes **dark** (inactive until cutover): `angel.service.js` → token-reader; `broker.controller.js` → proxy (behind `LIVE_DATA_EXTRACTED` flag). | flag off |
-| 3.4 | **Cutover — in a market-closed window (weekend evening):** ① flag brokers OFF in monolith, restart; ② flag brokers ON in live-data service; ③ nginx flips `/ws/prices` + `/ws/market` → :3004; ④ enable `LIVE_DATA_EXTRACTED` in monolith. Angel login/8:45-cron/token-scheduler now run **only** in the service. Markets are closed: zero ticks are flowing, so nothing can be missed. | reverse ①–④ (minutes, still inside the closed window) |
-| 3.5 | **War-room the next market open** (§14.2 checklist): broker connects at scheduler signal, ticks/s, `PRICE:LATEST` freshness, candle inserts appearing, admin-panel prices moving, monolith chart/movers/history endpoints fresh, frontend WS reconnects clean. | flags + nginx back; brokers restart in the monolith in <5 min. Safe **because we never dual-ran** — there is no session conflict on rollback either. |
-| 3.6 | **Bake 2–4 weeks** with monolith socket/broker code dormant. Then delete `sockets/`, `core/`, `brokers/`, moved `marketData/` files from the monolith. | git revert |
+| 3.1 | Start `live-data-service` on :3004 with the full move list (§8.1) and **brokers disabled by switch**. It serves both WebSocket endpoints, answering SUBSCRIBE with Redis snapshots — which still come from the monolith's ticks. The entire WebSocket/subscription layer gets validated on **live production data** with zero user exposure (diagram above). | stop the process |
+| 3.2 | **Replay validation:** feed the recorded golden ticks through the service's full pipeline (TickGate → aggregator → broadcast) in a test environment. Compare the produced candle rows and WebSocket messages to the golden files. | n/a |
+| 3.3 | Ship the two monolith-side adapters **dark** (present but inactive until the flag flips): the Angel token-reader (§8.5) and the broker-status proxy (§8.6). | flag stays off |
+| 3.4 | **Switch over in a market-closed window** (diagram above). The Angel login, 8:45 cron, and token scheduler now run **only** in the live-data service. | reverse ①–④, < 5 min |
+| 3.5 | **War-room the next market open** with the checklist in §15.2: brokers connect on schedule, ticks flow, Redis keys fresh, candles being written, charts moving, clients reconnected. | switches + nginx back; brokers restart in the monolith in < 5 min |
+| 3.6 | **Bake 2–4 weeks** with the monolith's socket/broker code dormant. Then delete `sockets/`, `core/`, `brokers/`, and the moved `marketData/` files from the monolith. | git revert |
 
 ### Phase 4 — Hardening (week 8).
 
-Secrets to env/secret manager (+ rotate both hardcoded secrets), `notif_targeting` read-only role live, CORS allowlist everywhere, remove flags, dashboards + alerts (§12), delete confirmed-dead `smartapiStream`, update docs, and remove the now-unneeded `uncaughtException → process.exit` coupling note from the ops runbook (a monolith crash no longer kills market data — celebrate that in the postmortem culture).
+Secrets into env files / a secret manager (+ rotate the two hardcoded secrets), the read-only targeting role live (§9.4), a real CORS allowlist everywhere, remove the now-unneeded switches, dashboards and alerts live (§13), delete `smartapiStream.js` if Phase 0.5 confirmed it dead, update documentation.
 
 ---
 
-<a name="11-risks"></a>
-## 11. Risk register
+<a name="12-risks"></a>
+## 12. Risk register
 
-| # | Risk | Phase | Likelihood | Impact | Mitigation |
+| # | Risk | Phase | Chance | Impact | Protection |
 |---|---|---|---|---|---|
-| 1 | Silent loss of trade auto-exit / plan-sync pushes (Defects 1–2) | 2 | **Certain under Gemini plan** | High | `NotificationClient` + integration tests for paths 3/4/5 + FCM failure-rate alert |
-| 2 | Candle writes stop (Defect 3) | 3 | **Certain under Gemini plan** | High | aggregator moves with WRITE pool; candle-insert-lag alert |
-| 3 | Monolith boot crash on missing `angelAuth` require (Defect 4) | 3 | **Certain under Gemini plan** | High, loud | token-reader shipped dark before cutover |
-| 4 | Angel session invalidation loops | 3 | High if dual-run | High | **no dual-run, ever**; single-writer token rule |
-| 5 | Mobile app breaks on moved endpoints | 2 | High without gateway | High | nginx keeps every public URL identical |
-| 6 | Duplicate notifications (double cron / stream redelivery) | 2 | Medium | Medium | DB claim + unique constraint (duplicates impossible by construction) |
-| 7 | nginx kills idle WS connections | 0 | Medium | Medium | `proxy_read_timeout` > ping interval; verified in 0.1 |
-| 8 | Notification service down → triggers lost | 2+ | Low | Medium | Stream buffers durably; PEL/backlog alert; messages process on recovery |
-| 9 | Reconnect storm at WS cutover | 3 | Medium | Low | cutover in closed window; clients already auto-reconnect; add jitter to frontend backoff opportunistically |
-| 10 | IST timezone wrong on new service host | 2 | Medium | Medium | explicit TZ check in deploy script + a scheduled-notification smoke test |
-| 11 | `module-alias` paths break when files move | 2–3 | Medium | Low, loud | boot smoke test in CI for each service |
-| 12 | Pool exhaustion from new services | 2–3 | Low | Medium | budget in §8.2; pool metrics + alerts |
-| 13 | Order-depth feature was already dead and migration "breaks" it cosmetically | 3 | Medium | Low | Phase 0.5 settles its status before anyone blames the migration |
+| 1 | Trade auto-exit / plan-sync pushes silently lost (Facts 1–2) | 2 | Certain *if the client is skipped* | High | `NotificationClient` + dedicated tests for paths 3/4/5 + FCM failure-rate alarm |
+| 2 | Candle writing stops (Fact 3) | 3 | Certain *if the aggregator is left behind or made read-only* | High | aggregator moves with a write pool; candle-insert alarm |
+| 3 | Monolith fails to boot on a missing import (Fact 4) | 3 | Certain *if the token-reader is skipped* | High but loud | token-reader shipped dark before switch-over |
+| 4 | Angel One session war (two logins fighting) | 3 | High if anything dual-runs | High | the single-owner rule; nothing ever dual-runs |
+| 5 | Mobile app breaks on a moved URL | 2 | High without a gateway | High | nginx keeps every public URL identical forever |
+| 6 | Duplicate notifications (double cron / redelivery) | 2+ | Medium | Medium | database claim + unique constraint — duplicates impossible by construction |
+| 7 | nginx cuts idle WebSocket connections | 0 | Medium | Medium | `proxy_read_timeout 120s` > the 30s ping; verified in Phase 0.1 |
+| 8 | Notification service down → triggers lost | 2+ | Low | Medium | the stream holds messages durably; backlog alarm; processed on recovery |
+| 9 | Reconnect storm at WebSocket switch-over | 3 | Medium | Low | switch-over happens in a closed window; clients already auto-reconnect |
+| 10 | Wrong timezone on the new service's machine | 2 | Medium | Medium | explicit TZ check in the deploy script + a scheduled-notification smoke test |
+| 11 | `module-alias` paths break when files move | 2–3 | Medium | Low, loud | a boot smoke test per service in CI |
+| 12 | Database connection exhaustion | 2–3 | Low | Medium | the pool budget (§9.2) + pool alarms |
+| 13 | Order-depth "breaks" — but was already dead (Fact 6) | 3 | Medium | Low | Phase 0.5 settles its status before anyone blames the migration |
 
 ---
 
-<a name="12-observability"></a>
-## 12. Observability
+<a name="13-observability"></a>
+## 13. Monitoring and alerts
 
-**Correlation IDs:** nginx stamps `X-Correlation-Id: $request_id` on every request; services log it; the monolith puts it into every stream message (`correlation_id` field, §6.2); the notification service logs it on consume and on FCM send. One grep then traces *admin click → stream → FCM message ID*.
+> **📘 New concept — correlation ID:** a unique label stamped on a request when it first arrives, then carried along everywhere that request goes — through the monolith, through the message pipe, into the notification service, onto the Firebase call. Searching the logs for that one ID shows the request's entire journey across all services. It is how you debug a multi-service system without going crazy.
 
-**Metrics that actually catch the failure modes in this document:**
+nginx stamps `X-Correlation-Id` on every request; services log it; the monolith puts it into every stream message (§7.2); the notification service logs it on consume and on the FCM send. One search then traces *admin click → pipe → Firebase message ID*.
 
-| Metric | Service | Alert | Catches |
+**Alarms that specifically catch this plan's failure modes:**
+
+| What we measure | Service | Alarm when | Catches |
 |---|---|---|---|
-| `tick_e2e_lag_ms` p50/p99 (broker `exchange_ts` → `ws.send`) | live-data | p99 > 2s for 1 min (market hours) | slow pipeline, GC stalls |
-| ticks/sec per broker | live-data | < 1 for 30s during market hours | dead broker connection |
-| broker state | live-data | `disconnected` > 60s in market hours | session/auth issues (risk 4) |
-| **candle insert rate + lag** | live-data | 0 inserts for 3 min in market hours | **Defect-3 class failures** |
-| TickGate reject % | live-data | > 50% for 5 min | upstream data corruption |
-| WS clients + `bufferedAmount` drops | live-data | clients = 0 for 2 min in market hours | proxy/cutover mistakes |
-| `notif:dispatch` PEL size + consumer lag | notif | PEL > 100 or lag > 60s | stuck/dead consumer |
-| DLQ depth | notif | > 0 | poisoned messages |
-| FCM failure rate | notif | > 10% over 5 min | credential/token issues, **silent-loss class failures** |
-| cron last-claim timestamp | notif | > 3 min stale | dead scheduler |
-| pool idle/waiting per service | all | 0 idle for 30s | risk 12 |
-| Redis `PRICE:LATEST:*` freshness (sampled) | monolith side | age > 90s in market hours | end-to-end canary from the *consumer's* viewpoint |
+| tick end-to-end delay (exchange timestamp → send to client) | live-data | p99 > 2s for 1 min (market hours) | slow pipeline |
+| ticks per second, per broker | live-data | < 1 for 30s during market hours | dead broker connection |
+| broker connection state | live-data | disconnected > 60s in market hours | session/login trouble (risk 4) |
+| **candle insert rate** | live-data | 0 inserts for 3 min in market hours | **the Fact-3 failure class** |
+| TickGate rejection % | live-data | > 50% for 5 min | bad upstream data |
+| WebSocket client count | live-data | 0 for 2 min in market hours | proxy/switch-over mistakes |
+| message-pipe backlog (pending + lag) | notif | backlog > 100 or lag > 60s | stuck or dead consumer |
+| DLQ size | notif | > 0 | poisoned messages |
+| FCM failure rate | notif | > 10% over 5 min | **the silent-loss failure class** |
+| cron last-claim time | notif | > 3 min old | dead scheduler |
+| DB pool idle/waiting | all | 0 idle for 30s | risk 12 |
+| `PRICE:LATEST:*` freshness, sampled **from the monolith side** | monolith | older than 90s in market hours | end-to-end check from the *consumer's* viewpoint |
 
-**Logging:** structured JSON in prod, one format across services. Live-data logs state changes and rejections only (never per-tick); notification service logs every send attempt with correlation ID and FCM message ID.
-
----
-
-<a name="13-testing"></a>
-## 13. Testing strategy
-
-1. **Golden contract tests** (built in Phase 0.2, run at every phase): recorded WS frames, REST response shapes, Redis value shapes, candle rows — diffed byte-for-byte where deterministic, schema-checked where not.
-2. **The five-path notification matrix** — each of §3.1's paths gets an end-to-end test: trigger → (stream) → `push_notifications` row → FCM call (mocked in CI, one real device in staging). Paths 3/4/5 are the regression tests Gemini's plan had no way to write, because it didn't know they existed.
-3. **Idempotency tests:** double-deliver a stream message → exactly one push; run two crons concurrently → exactly one claim; kill the consumer mid-batch → redelivery → still one push.
-4. **Replay tests** for live data (Phase 3.2): golden ticks in → identical candles and frames out.
-5. **Chaos drills in staging:** kill the notification service for 10 minutes during sends (messages wait in stream, drain on restart); kill live-data (clients reconnect, monolith REST unaffected, brokers reconnect per BaseBrokerWS state machine); restart Redis (both services reconnect; verify stream group survives — it does, streams are persistent if Redis has persistence enabled — **check `appendonly`/RDB config**, since dispatch durability now depends on it).
-6. **A full staging dress rehearsal of the Phase 3.4 cutover**, timed, before doing it in production.
+**Logging:** structured JSON in production, one shared format. The live-data service logs state changes and rejections only (never each tick — far too noisy). The notification service logs every send attempt with its correlation ID and Firebase message ID.
 
 ---
 
-<a name="14-runbooks"></a>
-## 14. Runbooks
+<a name="14-testing"></a>
+## 14. Testing strategy
 
-### 14.1 Live-data cutover (market-closed window)
+1. **Golden-file contract tests** (built in Phase 0.2, run at every later step): recorded WebSocket messages, REST response shapes, Redis value shapes, candle rows — compared byte-for-byte where outputs are deterministic, schema-checked where they are not.
+2. **The five-path notification matrix** — each path in §3.1 gets an end-to-end test: trigger → (pipe) → `push_notifications` row → FCM call (faked in CI, one real device in staging). Paths 3, 4 and 5 are the tests that protect the hidden connections in Facts 1–2.
+3. **Duplicate-protection tests:** deliver the same pipe message twice → exactly one push; run two crons at once → exactly one claim; kill the consumer mid-batch → redelivery → still exactly one push.
+4. **Replay tests** for live data (Phase 3.2): golden ticks in → identical candles and messages out.
+5. **Chaos drills in staging:** kill the notification service for 10 minutes during sends (messages wait in the pipe, drain on restart); kill the live-data service (clients reconnect, monolith REST unaffected, brokers reconnect by their built-in state machine); restart Redis (services reconnect; the stream group survives **if Redis persistence is on — check the `appendonly`/RDB config**, because message durability now depends on it).
+6. **A full dress rehearsal of the Phase 3.4 switch-over** in staging, with a stopwatch, before doing it in production.
+
+---
+
+<a name="15-runbooks"></a>
+## 15. Cutover and rollback runbooks
+
+### 15.1 Live-data switch-over (market-closed window)
 
 ```
-[ ] Confirm market is closed and next open is > 12h away
+[ ] Market is closed and the next open is > 12h away
 [ ] Staging dress rehearsal passed within the last week
-[ ] Golden fixtures current; replay test green
-[ ] Monolith: BROKERS_ENABLED=false → restart → confirm no broker logins in logs
-[ ] Live-data: BROKERS_ENABLED=true → confirm Angel login succeeds ONCE, token mirrored to ANGEL:SESSION
-[ ] nginx: flip /ws/prices + /ws/market upstreams → reload → test client connects, snapshot replies arrive
-[ ] Monolith: LIVE_DATA_EXTRACTED=true (token-reader + broker proxy active)
-[ ] Verify: admin panel loads, charts/history/movers serve (stale-but-served is correct while closed)
-[ ] Schedule war-room for next market open
+[ ] Golden files current; replay test green
+[ ] Monolith: BROKERS_ENABLED=false → restart → confirm zero broker logins in its logs
+[ ] Live-data: BROKERS_ENABLED=true → Angel login succeeds ONCE, token visible in ANGEL:SESSION
+[ ] nginx: flip /ws/prices + /ws/market upstreams → reload → test client connects,
+    snapshot replies arrive
+[ ] Monolith: LIVE_DATA_EXTRACTED=true (token-reader + broker proxy now active)
+[ ] Admin panel loads; charts/history/movers serve (stale-but-served is CORRECT while closed)
+[ ] War-room scheduled for the next market open
 ```
 
-### 14.2 First-market-open war room
+### 15.2 First-market-open war room
 
 ```
-[ ] MarketScheduler flips to OPEN; brokers auto-connect (BaseBrokerWS state log)
-[ ] ticks/s > 0 within 60s of open;  tick_e2e_lag p99 < 2s
-[ ] PRICE:LATEST freshness < 90s (checked FROM the monolith — consumer's viewpoint)
-[ ] Candle inserts appearing in TimescaleDB (the Defect-3 check)
+[ ] Market scheduler flips to OPEN; brokers auto-connect (state visible in logs)
+[ ] ticks/sec > 0 within 60s of open;  end-to-end tick delay p99 < 2s
+[ ] PRICE:LATEST freshness < 90s — checked FROM the monolith (the consumer's viewpoint)
+[ ] Candle inserts appearing in TimescaleDB        ← the Fact-3 check
 [ ] Admin panel: live prices moving; charts updating; movers fresh
-[ ] broker.controller proxy returns real broker health
-[ ] No Angel auth errors in EITHER service's logs (single-writer check)
-[ ] WS client count ≈ pre-migration baseline
+[ ] broker-status page shows real broker health (the proxy works)
+[ ] ZERO Angel auth errors in EITHER service's logs (the single-owner check)
+[ ] WebSocket client count ≈ the pre-migration normal
 ```
 
-### 14.3 Rollback (any phase)
+### 15.3 Rollback, per phase
 
 | Phase | Action | Time |
 |---|---|---|
-| 0–1 | flip flag (`NOTIF_VIA_STREAM=false`) | seconds |
-| 2 (routes) | flip nginx upstream line, reload | seconds |
-| 2 (consumer/cron) | flip two flags; DB claim makes the overlap safe | < 1 min |
-| 3 | reverse the four cutover steps; brokers restart in monolith | < 5 min, no session conflicts because nothing dual-runs |
-| post-deletion | git revert of the deletion commit + redeploy | < 30 min — which is why deletion waits for the bake period |
+| 0–1 | flip one switch (`NOTIF_VIA_STREAM=false`) | seconds |
+| 2 (routes) | flip the nginx upstream line, reload | seconds |
+| 2 (consumer/cron) | flip two switches; the DB claim makes the overlap safe | < 1 min |
+| 3 | reverse the four switch-over steps; brokers restart in the monolith | < 5 min, no session conflicts because nothing ever dual-ran |
+| after deletion | git revert of the deletion commit + redeploy | < 30 min — which is exactly why deletion waits for the bake period |
 
 ---
 
-<a name="15-structure"></a>
-## 15. Folder structure and deployment
+<a name="16-structure"></a>
+## 16. Folder structure and deployment
 
-Gemini's monorepo layout (its §12.1) is broadly fine. Corrections only:
+### 16.1 Target layout
 
-- `live-data-service/src/services/marketData/` **additionally contains** `realtimeAggregator.service.js` (+ `tickGenerator.service.js` if Phase 0.5 confirms it's in the tick path), and `db/` has a **read/write** `timescaleClient.js`.
-- `live-data-service` does **not** contain `smartapiStream.js`/`price.service.js` unless Phase 0.5 proves depth is live (`price.service` is a read-side monolith service — Gemini misplaced it).
-- `main-backend` **gains** two small files Gemini's structure lacks: `services/notificationClient.js` and `services/marketData/angelTokenReader.js`.
-- `notification-service` gains `consumers/dispatchConsumer.js`, `consumers/dlqRedrive.js`, and a second locked-down pool `db/targetingDb.js`.
-- Add `gateway/nginx.conf` to the repo root — the routing table *is* the migration state; it must be version-controlled.
+```
+trade-platform/
+├── gateway/
+│   └── nginx.conf                  ← the routing table IS the migration state;
+│                                      it must live in version control
+├── main-backend/                   ← the monolith (slimmed down at the end)
+│   └── src/
+│       ├── index.js                ← no socket/broker/notification code (after bake)
+│       ├── controllers/  routes/  middleware/  models/  db/  utils/
+│       └── services/
+│           ├── notificationClient.js        ← NEW (tiny, stays forever)
+│           └── marketData/angelTokenReader.js ← NEW (tiny, stays forever)
+│
+├── notification-service/
+│   └── src/
+│       ├── server.js               ← Express + cron startup
+│       ├── config/      (env, firebase, logger)
+│       ├── middleware/  (authenticateUser, authorizeAccess — copies)
+│       ├── services/    (push, notificationBroadcast, autoNotification, cron)
+│       ├── controllers/ (the three notification controllers)
+│       ├── routes/      (the three notification route files)
+│       ├── consumers/   (dispatchConsumer.js, dlqRedrive.js)
+│       └── db/          (db.js — victory_db pool max 5,
+│                          targetingDb.js — the read-only role, §9.4)
+│
+├── live-data-service/
+│   └── src/
+│       ├── server.js               ← HTTP + WebSocket startup, /health
+│       ├── config/      (env, brokerConfig, logger)
+│       ├── sockets/     (all 8 files, as-is)
+│       ├── core/        (all 6 files, as-is)
+│       ├── brokers/dhan/ (all 4 files, as-is)
+│       ├── services/marketData/ (angel auth/login/scheduler/WS v1+v2,
+│       │                          realtimeAggregator ← the candle writer)
+│       └── db/          (redisClient, timescaleClient — READ/WRITE pool max 10)
+│
+└── strategy-engine/                ← untouched
+```
 
-**Deployment reality check:** today this stack runs as bare Node processes (nodemon) on a Windows/EC2 box — not Docker. The docker-compose target is right for the future, but don't couple the migration to a containerization project (two migrations at once is how both fail). A PM2 ecosystem file gives process management, restart-on-crash, and log capture *now*:
+### 16.2 Deployment, honestly
+
+Today this stack runs as plain Node processes on a Windows/EC2 machine — not in Docker. Containerizing is a fine future goal, **but doing two migrations at once is how both fail**. So: run the new services the same way the current one runs, managed by PM2.
+
+> **📘 New concept — PM2:** a production process manager for Node.js. It starts your apps, restarts them automatically if they crash, captures their logs, and survives reboots. It is the simplest professional upgrade from "nodemon in a terminal window".
 
 ```js
 // ecosystem.config.js
@@ -968,41 +998,60 @@ module.exports = {
 };
 ```
 
-Containerize in a separate, later project once the service boundaries have proven stable.
+Move to Docker/Compose as a separate project later, once the service boundaries have proven themselves stable.
 
 ---
 
-<a name="16-bites"></a>
-## 16. Things that will bite you (corrected and extended)
+<a name="17-bites"></a>
+## 17. Things that will bite you — the checklist of classic mistakes
 
-Gemini's §14.7 list was its best section — items 1–10 there are real (cookie-parser, redis-vs-ioredis, CORS, Firebase JSON path, MarketScheduler/BrokerManager singletons, InternalTokenList pool, broadcastPrice chain, graceful shutdown, IST cron). Keep all of them, **plus** the ones it missed:
-
-11. **`angel.service.js:2`** requires a file you're moving — the monolith won't boot (Defect 4). Ship the token-reader *before* cutover day.
-12. **The four notification import sites** (§6.2 table) — miss one and that flow silently dies. Grep for `notificationBroadcast.service`, `planSync.service`, and `config/firebase` in the monolith after the swap; the only remaining hit should be `notificationClient.js` itself.
-13. **`push_notifications` may already contain duplicates** — the unique constraint will fail to apply until you clean them. Check before Phase 1.3, not on the night you need it. If duplicates exist, follow the archive-first procedure in §8.5 — never a bare `DELETE` on production rows.
-14. **nginx `proxy_read_timeout` vs the 30s WS ping** — default 60s is uncomfortably close; set 120s+ or you'll chase phantom disconnects.
-15. **`module-alias` in the monolith's package.json** — moved files that relied on alias paths resolve differently in the new repos. A boot smoke test per service in CI catches this in seconds.
-16. **Redis persistence** — notification dispatch durability now depends on Redis surviving restarts. Confirm AOF or RDB is enabled; default Windows Redis 5 configs often have weak persistence.
-17. **`client_max_body_size` in nginx** — the monolith accepts 50 MB JSON; nginx defaults to 1 MB and will 413 the market-data imports the day after you add the proxy. Set it in Phase 0.1.
-18. **The `uploads/` static directory and `charting_library-master`** are served by the monolith from local disk — they stay with it; don't route those paths anywhere else.
-19. **`broker.controller.js`** returns a confidently empty answer after extraction instead of erroring (Defect 5) — flip it to the proxy in the same deploy as cutover, not "later".
-20. **Don't "fix" things mid-move.** Every refactor you bundle into the migration multiplies the diff you must reason about when something breaks at 9:15 AM on the first market open. Move ugly code as-is; schedule beautification for after the bake period.
+1. **Forgetting cookie-parser in the notification service** — JWT arrives in a cookie; without the parser, every authenticated request fails with "no token".
+2. **Mixing Redis client libraries** — this codebase uses the `redis` npm package; the Strategy Engine uses `ioredis`. Pick one per service and stay consistent — their APIs differ subtly.
+3. **CORS not byte-identical** — copy the monolith's CORS settings exactly at first; tighten later, everywhere at once (§10).
+4. **Firebase service-account JSON path** — it's referenced by path in `config/firebase.js`; the path must be updated for the new service's directory.
+5. **MarketScheduler running in two places** — only the live-data service may run it after Phase 3, or brokers get double connect/disconnect commands.
+6. **BrokerManager is a singleton** — in the new process it initializes fresh; make sure every broker config is passed in explicitly.
+7. **`InternalTokenList` polling** — the WebSocket layer refreshes its enabled-symbols list from the DB every 30s; the live-data service needs DB access for this from day one.
+8. **The `broadcastPrice` callback chain** — in `index.js`, `broadcastPrice` is handed into the Angel WebSocket setup as a callback. The whole chain moves together or ticks vanish.
+9. **Graceful shutdown** — the live-data service needs its own SIGTERM handler calling `BrokerManager.stopAll()`, like the monolith has today.
+10. **Timezone** — the scheduled-notification cron compares IST times. The new machine must be on Asia/Kolkata (or the code's IST conversion verified) — see risk 10.
+11. **`angel.service.js:2` imports a file you are moving** (Fact 4) — ship the token-reader *before* switch-over day, or the monolith won't boot.
+12. **The four import-swap sites** (§7.2) — after swapping, search the monolith for `notificationBroadcast.service`, `planSync.service`, and `config/firebase`; the only remaining hit should be `notificationClient.js` itself.
+13. **`push_notifications` may already contain duplicates** — the unique constraint won't apply until they're handled. Check early (Phase 1.3), and follow the archive-first procedure in §9.5 — never a bare `DELETE` on production rows.
+14. **nginx `proxy_read_timeout` vs the 30s WebSocket ping** — the default 60s is uncomfortably close; set 120s+ or you will chase phantom disconnects.
+15. **`module-alias` in the monolith's package.json** — moved files that used alias paths resolve differently in a new repo. A boot smoke test per service in CI catches this in seconds.
+16. **Redis persistence** — notification delivery durability now depends on Redis surviving a restart. Confirm AOF or RDB persistence is enabled; default Windows Redis 5 configs are often weak here.
+17. **`client_max_body_size` in nginx** — the monolith accepts 50 MB JSON; nginx defaults to 1 MB and will reject the market-data imports the day after you add the proxy. Set it in Phase 0.1.
+18. **`uploads/` and `charting_library-master`** are served from the monolith's local disk — they stay with the monolith; don't route those paths anywhere else.
+19. **`broker.controller.js`** must flip to the proxy **in the same deploy** as the live-data switch-over (Fact 5) — not "later", or the broker status page lies in between.
+20. **Don't "improve" code mid-move.** Every refactor bundled into the migration multiplies what you must reason about when something looks wrong at 9:15 AM on the first market open. Move ugly code as-is; schedule the beautification for after the bake period.
 
 ---
 
-## Final implementation order (one page)
+<a name="18-order"></a>
+## 18. Final implementation order — one page
 
 ```
-Week 1   Phase 0: nginx pass-through · golden traffic capture · health checks
-         · 5-path integration tests · dead-code verdicts (smartapiStream, req.session, control_tradingdays)
-Week 2   Phase 1: NotificationClient + 4 import swaps · in-monolith stream loop (flagged)
-         · DB claim columns + unique constraint
-Weeks 3–4 Phase 2: notif-svc up · nginx canary per route group (query → CRUD → feed → send)
-         · consumer flip · cron flip · 2-week bake → delete monolith notif code
-Weeks 5–7 Phase 3: live-data-svc up (brokers off, WS validated on live Redis) · golden replay
-         · dark-ship token-reader + broker proxy · market-closed cutover · war-room first open
-         · 2–4-week bake → delete monolith socket/broker code
-Week 8   Phase 4: secrets rotated · notif_targeting role · CORS allowlist · alerts live · docs
+Week 1    Phase 0: nginx pass-through · golden files recorded · health checks
+          · five-path notification tests · open questions settled
+          (smartapiStream alive? req.session used? control_tradingdays location?)
+
+Week 2    Phase 1: NotificationClient + 4 import swaps · message pipe running
+          INSIDE the monolith (switch-controlled) · claim columns + unique
+          constraint (run by hand, after backup)
+
+Weeks 3–4 Phase 2: notification service up · nginx canary, one route group at a
+          time (query → CRUD → user feed → send) · consumer flip · cron flip
+          · 2-week bake → only then delete the monolith's notification code
+
+Weeks 5–7 Phase 3: live-data service up (brokers OFF — WebSocket layer validated
+          on live Redis data) · golden replay test · token-reader + broker proxy
+          shipped dark · weekend market-closed switch-over · war-room the first
+          market open · 2–4-week bake → only then delete the monolith's
+          socket/broker code
+
+Week 8    Phase 4: secrets rotated into env · read-only targeting role ·
+          CORS allowlist · alarms live · documentation updated
 ```
 
-**What you must NOT touch** (unchanged from Gemini, it was right): the Strategy Engine and its Signal WS, the data pipeline / `ohlc:candle_close` flow, JWT issuance, database schemas (beyond the two additive notification changes), and any business logic beyond the explicitly listed import swaps and the two monolith-side adapters.
+**What we deliberately do NOT touch:** the Strategy Engine (:3003) and its signal WebSocket — it is already a separate, working service; the data pipeline and its `ohlc:candle_close` Redis events — already decoupled; JWT issuance — unchanged; database schemas — unchanged except the two additive notification columns/constraint; and any business logic beyond the explicitly listed import swaps and the two small adapters.
